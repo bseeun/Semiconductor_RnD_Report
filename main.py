@@ -20,6 +20,30 @@ from state import SupervisorState
 from config import DEFAULT_TECHNOLOGIES, DEFAULT_COMPANIES
 
 
+def _register_pdf_korean_font() -> str:
+    """ReportLab에서 사용할 한글 폰트를 등록하고 폰트명을 반환."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    candidates = [
+        os.getenv("PDF_FONT_PATH", "").strip(),
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/System/Library/Fonts/Supplemental/AppleMyungjo.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            continue
+        try:
+            pdfmetrics.registerFont(TTFont("KOR_FONT", path))
+            return "KOR_FONT"
+        except Exception:
+            continue
+    return "Helvetica"
+
+
 def _render_markdown_pdf(report_markdown: str, output_path: str) -> bool:
     """
     Markdown -> HTML -> PDF 렌더링.
@@ -123,8 +147,6 @@ def _render_markdown_pdf(report_markdown: str, output_path: str) -> bool:
 def _save_report_pdf(report: str, output_path: str) -> None:
     """텍스트 보고서를 PDF로 저장."""
     from reportlab.lib.pagesizes import A4
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
     from reportlab.pdfgen import canvas
 
     c = canvas.Canvas(output_path, pagesize=A4)
@@ -132,13 +154,8 @@ def _save_report_pdf(report: str, output_path: str) -> None:
     left, top, bottom = 40, height - 40, 40
     line_height = 14
 
-    # 한글 표시용 CID 폰트 시도 (환경에 따라 실패할 수 있어 fallback 포함)
-    font_name = "Helvetica"
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
-        font_name = "HYSMyeongJo-Medium"
-    except Exception:
-        font_name = "Helvetica"
+    # 한글 폰트 자동 등록 (실패 시 Helvetica)
+    font_name = _register_pdf_korean_font()
 
     y = top
     c.setFont(font_name, 10)
@@ -155,6 +172,133 @@ def _save_report_pdf(report: str, output_path: str) -> None:
             y -= line_height
 
     c.save()
+
+
+def _render_markdown_pdf_reportlab(report_markdown: str, output_path: str) -> bool:
+    """시스템 라이브러리 없이 동작하는 ReportLab 기반 Markdown 렌더링."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.platypus import (
+            ListFlowable,
+            ListItem,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+        from xml.sax.saxutils import escape
+    except Exception:
+        return False
+
+    styles = getSampleStyleSheet()
+    font_name = _register_pdf_korean_font()
+    s_h1 = styles["Heading1"]
+    s_h2 = styles["Heading2"]
+    s_h3 = styles["Heading3"]
+    s_body = styles["BodyText"]
+    s_h1.fontName = font_name
+    s_h2.fontName = font_name
+    s_h3.fontName = font_name
+    s_body.fontName = font_name
+    s_body.leading = 16
+    s_code = ParagraphStyle(
+        "Code",
+        parent=s_body,
+        fontName="Courier",
+        backColor=colors.whitesmoke,
+        borderPadding=4,
+        leading=14,
+    )
+
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=40,
+        bottomMargin=36,
+    )
+    story = []
+    lines = report_markdown.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        if not line.strip():
+            story.append(Spacer(1, 6))
+            i += 1
+            continue
+
+        if line.startswith("### "):
+            story.append(Paragraph(escape(line[4:]), s_h3))
+            i += 1
+            continue
+        if line.startswith("## "):
+            story.append(Paragraph(escape(line[3:]), s_h2))
+            i += 1
+            continue
+        if line.startswith("# "):
+            story.append(Paragraph(escape(line[2:]), s_h1))
+            i += 1
+            continue
+
+        if line.startswith("```"):
+            code_buf = []
+            i += 1
+            while i < len(lines) and not lines[i].startswith("```"):
+                code_buf.append(lines[i])
+                i += 1
+            i += 1  # closing ```
+            story.append(Paragraph(escape("<br/>".join(code_buf)), s_code))
+            story.append(Spacer(1, 6))
+            continue
+
+        if line.lstrip().startswith(("- ", "* ")):
+            items = []
+            while i < len(lines) and lines[i].lstrip().startswith(("- ", "* ")):
+                txt = lines[i].lstrip()[2:].strip()
+                items.append(ListItem(Paragraph(escape(txt), s_body)))
+                i += 1
+            story.append(ListFlowable(items, bulletType="bullet", leftIndent=14))
+            story.append(Spacer(1, 4))
+            continue
+
+        # Markdown table
+        if line.startswith("|") and i + 1 < len(lines) and set(lines[i + 1].replace("|", "").strip()) <= {"-", ":", " "}:
+            rows = []
+            while i < len(lines) and lines[i].startswith("|"):
+                cells = [escape(c.strip()) for c in lines[i].strip().strip("|").split("|")]
+                rows.append(cells)
+                i += 1
+            if rows:
+                tbl = Table(rows, repeatRows=1)
+                tbl.setStyle(
+                    TableStyle(
+                        [
+                            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                            ("FONTNAME", (0, 0), (-1, 0), font_name),
+                            ("FONTNAME", (0, 1), (-1, -1), font_name),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("FONTSIZE", (0, 0), (-1, -1), 9),
+                        ]
+                    )
+                )
+                story.append(tbl)
+                story.append(Spacer(1, 6))
+            continue
+
+        # 일반 문단
+        story.append(Paragraph(escape(line), s_body))
+        i += 1
+
+    try:
+        doc.build(story)
+        return True
+    except Exception:
+        return False
 
 
 def run_analysis(
@@ -252,6 +396,9 @@ def run_analysis(
             # 2) 실패 시 텍스트 PDF fallback
             ok = _render_markdown_pdf(report, output_path)
             if not ok:
+                ok = _render_markdown_pdf_reportlab(report, output_path)
+            if not ok:
+                print("[PDF] Markdown 렌더 실패 -> 텍스트 PDF fallback 사용")
                 _save_report_pdf(report, output_path)
         else:
             with open(output_path, "w", encoding="utf-8") as f:
