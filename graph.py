@@ -1,7 +1,7 @@
 """
 graph.py — LangGraph 그래프 정의
 Supervisor 기반 중앙 제어 구조
-Web Search + RAG 병렬 수집 → Balanced → TRL → Analyze → Draft → Validate → Format
+Parallel Retrieve (Web+RAG) → Balanced → TRL → Analyze → Draft → Validate → Format → Supervisor → END
 """
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ from state import SupervisorState
 from agents import (
     supervisor_node,
     query_planning_node,
-    web_search_node,
-    rag_node,
+    parallel_retrieve_node,
     balanced_retrieval_node,
     trl_preparation_node,
     competitive_analyst_node,
@@ -28,7 +27,7 @@ def _route_supervisor(state: SupervisorState) -> str:
     action = state.get("next_action", "end")
     routing = {
         "plan": "query_planning",
-        "retrieve": "web_search",       # RAG는 web_search 이후 병렬 처리
+        "retrieve": "parallel_retrieve",
         "balance": "balanced_retrieval",
         "prepare_trl": "trl_preparation",
         "analyze": "competitive_analyst",
@@ -57,22 +56,20 @@ def build_graph(checkpointer=None):
     그래프 구성:
 
     [START] → supervisor → (route) → query_planning
-                                    → web_search → rag (병렬)
+                                    → parallel_retrieve (Web+RAG 스레드 병렬)
                                     → balanced_retrieval
                                     → trl_preparation
                                     → competitive_analyst
                                     → draft_generation
                                     → validation → (조건부) draft_generation | supervisor
-                                    → formatting
-                                    → [END]
+                                    → formatting → supervisor → [END]
     """
     graph = StateGraph(SupervisorState)
 
     # ── 노드 등록
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("query_planning", query_planning_node)
-    graph.add_node("web_search", web_search_node)
-    graph.add_node("rag", rag_node)
+    graph.add_node("parallel_retrieve", parallel_retrieve_node)
     graph.add_node("balanced_retrieval", balanced_retrieval_node)
     graph.add_node("trl_preparation", trl_preparation_node)
     graph.add_node("competitive_analyst", competitive_analyst_node)
@@ -89,7 +86,7 @@ def build_graph(checkpointer=None):
         _route_supervisor,
         {
             "query_planning": "query_planning",
-            "web_search": "web_search",
+            "parallel_retrieve": "parallel_retrieve",
             "balanced_retrieval": "balanced_retrieval",
             "trl_preparation": "trl_preparation",
             "competitive_analyst": "competitive_analyst",
@@ -103,10 +100,7 @@ def build_graph(checkpointer=None):
     # ── 각 노드 완료 후 supervisor로 복귀 (순차 흐름)
     graph.add_edge("query_planning", "supervisor")
 
-    # web_search와 rag는 병렬로 실행 후 supervisor 복귀
-    # LangGraph에서 병렬은 같은 엣지 소스에서 두 노드로 분기
-    graph.add_edge("web_search", "rag")      # web → rag (순차 병합 방식)
-    graph.add_edge("rag", "supervisor")
+    graph.add_edge("parallel_retrieve", "supervisor")
 
     graph.add_edge("balanced_retrieval", "supervisor")
     graph.add_edge("trl_preparation", "supervisor")
@@ -123,7 +117,7 @@ def build_graph(checkpointer=None):
         },
     )
 
-    graph.add_edge("formatting", END)
+    graph.add_edge("formatting", "supervisor")
 
     return graph.compile(checkpointer=checkpointer or MemorySaver())
 

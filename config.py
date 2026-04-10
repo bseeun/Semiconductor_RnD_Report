@@ -79,3 +79,5 @@ DEFAULT_TECHNOLOGIES = ["HBM4", "PIM", "CXL"]
 DEFAULT_COMPANIES = ["Samsung", "Micron", "SK Hynix", "Broadcom", "TSMC"]
 MAX_VALIDATION_RETRY = 2
 MAX_FLOW_RETRY = 3
+
+# 균형/MMR 튜닝은 환경변수 (retrieval_utils.py) — README 표 참고

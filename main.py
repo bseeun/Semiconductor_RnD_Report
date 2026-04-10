@@ -10,6 +10,10 @@ from dotenv import load_dotenv
 # LangSmith 등 .env는 LangChain/LangGraph import 전에 로드해야 추적이 안정적으로 켜짐
 load_dotenv()
 
+from langsmith_setup import configure_langsmith
+
+configure_langsmith()
+
 from graph import app
 from state import SupervisorState
 from config import DEFAULT_TECHNOLOGIES, DEFAULT_COMPANIES
@@ -51,6 +55,7 @@ def run_analysis(
         "balanced_documents": [],
         "aggregated_signals": [],
         "analysis_result": [],
+        "document_extractions": [],
         "draft_history": [],
         "current_draft": "",
         "validation": {
@@ -76,8 +81,11 @@ def run_analysis(
     }
 
     if os.getenv("LANGCHAIN_TRACING_V2", "").lower() in ("true", "1", "yes"):
-        proj = os.getenv("LANGCHAIN_PROJECT", "(default)")
-        print(f"[LangSmith] 추적 활성화 → 프로젝트: {proj} (실행 후 대시보드에서 확인)")
+        proj = os.getenv("LANGCHAIN_PROJECT", "semiconductor-rnd")
+        print(
+            f"[LangSmith] 추적 활성화 → 프로젝트: {proj}\n"
+            f"            대시보드: https://smith.langchain.com"
+        )
 
     print(f"\n{'='*60}")
     print(f"반도체 R&D 기술 전략 분석 에이전트 시작")

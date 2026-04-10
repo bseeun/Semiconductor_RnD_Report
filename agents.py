@@ -1,7 +1,7 @@
 """
 agents.py — 각 에이전트/노드 구현
-Supervisor → QueryPlanning → WebSearch + RAG(병렬) → Balanced →
-TRLPrep → CompetitiveAnalyst → DraftGeneration → Formatting
+Supervisor → QueryPlanning → ParallelRetrieve(Web+RAG) → Balanced →
+TRLPrep → CompetitiveAnalyst(Task4추출) → Draft → Validation → Formatting → Supervisor
 """
 from __future__ import annotations
 
@@ -20,8 +20,21 @@ from config import (
     MAX_VALIDATION_RETRY, MAX_FLOW_RETRY,
 )
 from state import (
-    SupervisorState, SearchQuery, RetrievedDocument,
-    Signal, CompetitorAnalysis, ValidationState,
+    SupervisorState,
+    SearchQuery,
+    RetrievedDocument,
+    Signal,
+    CompetitorAnalysis,
+    ValidationState,
+    DocumentExtraction,
+)
+from retrieval_utils import (
+    canonical_company,
+    parse_scope_dates,
+    doc_within_scope,
+    mmr_select,
+    MIN_CREDIBILITY_FOR_BALANCE,
+    MMR_POOL_SIZE,
 )
 
 llm = get_llm()
@@ -96,22 +109,27 @@ def supervisor_node(state: SupervisorState) -> SupervisorState:
         return {**state, "next_action": "end"}
 
     # 흐름 순서 결정
-    flow_map = {
-        "plan": "retrieve",
-        "retrieve": "balance",
-        "balance": "prepare_trl",
-        "prepare_trl": "analyze",
-        "analyze": "draft",
-        "draft": "validate",
-        "validate": _decide_after_validate(state),
-        "format": "end",
-    }
-
-    if current in flow_map:
-        next_action = flow_map[current]
+    # "plan": 검색 쿼리가 아직 없으면 라우터가 query_planning으로 가도록 next_action을 "plan"으로 유지
+    if current == "plan" and not state.get("search_queries"):
+        next_action = "plan"
     else:
-        next_action = "end"
+        flow_map = {
+            "plan": "retrieve",
+            "retrieve": "balance",
+            "balance": "prepare_trl",
+            "prepare_trl": "analyze",
+            "analyze": "draft",
+            "draft": "validate",
+            "validate": _decide_after_validate(state),
+            "format": "end",
+        }
+        if current in flow_map:
+            next_action = flow_map[current]
+        else:
+            next_action = "end"
 
+    if current == "format" and next_action == "end":
+        print("[Supervisor] 최종 보고서 정리 완료 → 종료")
     print(f"[Supervisor] {current} → {next_action}")
     return {**state, "next_action": next_action}
 
@@ -233,11 +251,11 @@ def _default_queries(techs: List[str], companies: List[str]) -> List[SearchQuery
 
 
 # ═══════════════════════════════════════════════════════
-# 3. Web Search Agent
+# 3. Web Search / RAG 수집 (병렬 노드에서 공용)
 # ═══════════════════════════════════════════════════════
-def web_search_node(state: SupervisorState) -> SupervisorState:
+def collect_web_documents(state: SupervisorState) -> List[RetrievedDocument]:
     queries = [q for q in state.get("search_queries", []) if q.get("target") == "web"]
-    existing = state.get("retrieved_documents", [])
+    targets = state.get("target_companies", DEFAULT_COMPANIES)
     new_docs: List[RetrievedDocument] = []
 
     for q in queries:
@@ -246,13 +264,16 @@ def web_search_node(state: SupervisorState) -> SupervisorState:
             if isinstance(results, str):
                 results = json.loads(results)
             for r in results:
+                co = _extract_company(r.get("title", "") + r.get("snippet", ""), state)
                 doc: RetrievedDocument = {
                     "source": "web",
                     "title": r.get("title", ""),
                     "content": r.get("snippet", r.get("body", "")),
                     "url": r.get("link", r.get("href", "")),
-                    "company": _extract_company(r.get("title", "") + r.get("snippet", ""), state),
-                    "technology": _extract_technology(r.get("title", "") + r.get("snippet", ""), state),
+                    "company": canonical_company(co, targets) if co else "",
+                    "technology": _extract_technology(
+                        r.get("title", "") + r.get("snippet", ""), state
+                    ),
                     "published_at": r.get("date", datetime.now().strftime("%Y-%m")),
                     "relevance_score": 0.7,
                     "credibility_score": _calc_credibility(r.get("link", "")),
@@ -264,6 +285,12 @@ def web_search_node(state: SupervisorState) -> SupervisorState:
         except Exception as e:
             print(f"[WebSearch] 쿼리 실패 '{q['query']}': {e}")
 
+    return new_docs
+
+
+def web_search_node(state: SupervisorState) -> SupervisorState:
+    existing = state.get("retrieved_documents", [])
+    new_docs = collect_web_documents(state)
     print(f"[WebSearch] {len(new_docs)}개 문서 수집")
     return {**state, "retrieved_documents": existing + new_docs, "next_action": "retrieve"}
 
@@ -278,9 +305,9 @@ def _calc_credibility(url: str) -> float:
 # ═══════════════════════════════════════════════════════
 # 4. RAG Agent
 # ═══════════════════════════════════════════════════════
-def rag_node(state: SupervisorState) -> SupervisorState:
+def collect_rag_documents(state: SupervisorState) -> List[RetrievedDocument]:
     queries = [q for q in state.get("search_queries", []) if q.get("target") == "rag"]
-    existing = state.get("retrieved_documents", [])
+    targets = state.get("target_companies", DEFAULT_COMPANIES)
     new_docs: List[RetrievedDocument] = []
 
     try:
@@ -297,12 +324,15 @@ def rag_node(state: SupervisorState) -> SupervisorState:
                 meta = results["metadatas"][0][i] if results.get("metadatas") else {}
                 distance = results["distances"][0][i] if results.get("distances") else 0.5
                 pub = meta.get("published_at") or ""
+                co_raw = meta.get("company", "") or ""
                 doc: RetrievedDocument = {
                     "source": "rag",
                     "title": meta.get("title", "내부 문서"),
                     "content": doc_text,
                     "url": meta.get("url", "internal"),
-                    "company": meta.get("company", ""),
+                    "company": canonical_company(str(co_raw), targets)
+                    if co_raw
+                    else "",
                     "technology": meta.get("technology", ""),
                     "published_at": pub,
                     "source_type": meta.get("source_type", ""),
@@ -321,8 +351,33 @@ def rag_node(state: SupervisorState) -> SupervisorState:
     except Exception as e:
         print(f"[RAG] ChromaDB 조회 실패: {e}")
 
+    return new_docs
+
+
+def rag_node(state: SupervisorState) -> SupervisorState:
+    existing = state.get("retrieved_documents", [])
+    new_docs = collect_rag_documents(state)
     print(f"[RAG] {len(new_docs)}개 문서 검색")
     return {**state, "retrieved_documents": existing + new_docs, "next_action": "retrieve"}
+
+
+def parallel_retrieve_node(state: SupervisorState) -> SupervisorState:
+    """Web + RAG 동시 수집(Thread) 후 retrieved_documents 병합."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    existing = list(state.get("retrieved_documents") or [])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fw = pool.submit(collect_web_documents, state)
+        fr = pool.submit(collect_rag_documents, state)
+        w_docs = fw.result()
+        r_docs = fr.result()
+
+    merged = existing + w_docs + r_docs
+    print(
+        f"[Retrieve/parallel] web={len(w_docs)} rag={len(r_docs)} "
+        f"→ 합계 {len(merged)}개"
+    )
+    return {**state, "retrieved_documents": merged, "next_action": "retrieve"}
 
 
 # ═══════════════════════════════════════════════════════
@@ -330,9 +385,12 @@ def rag_node(state: SupervisorState) -> SupervisorState:
 # ═══════════════════════════════════════════════════════
 def balanced_retrieval_node(state: SupervisorState) -> SupervisorState:
     """
-    중복 제거 + 출처 다양성 확보 + 최신성·신뢰도 기반 재정렬
+    중복 제거 + scope·신뢰도 필터 + 점수 정렬 + MMR로 다양성 확보
     """
     docs = state.get("retrieved_documents", [])
+    targets = state.get("target_companies", DEFAULT_COMPANIES)
+    scope = state.get("scope") or {}
+    date_from, date_to = parse_scope_dates(scope)
 
     seen: set[tuple] = set()
     unique_docs: List[RetrievedDocument] = []
@@ -343,8 +401,37 @@ def balanced_retrieval_node(state: SupervisorState) -> SupervisorState:
         seen.add(key)
         unique_docs.append(doc)
 
-    # final_score 계산
     for doc in unique_docs:
+        if doc.get("company"):
+            doc["company"] = canonical_company(str(doc["company"]), targets)
+
+    scoped = [d for d in unique_docs if doc_within_scope(d, date_from, date_to)]
+    if len(scoped) < max(3, len(unique_docs) // 4):
+        pool_docs = unique_docs
+        print("[BalancedRetrieval] scope 적용 시 문서 과소 → 전체 풀 사용")
+    else:
+        pool_docs = scoped
+
+    cred_floor = MIN_CREDIBILITY_FOR_BALANCE
+    official_ok = [
+        d
+        for d in pool_docs
+        if float(d.get("credibility_score", 0)) >= cred_floor
+        or _meta_truthy_flag(d.get("is_official_source"))
+    ]
+    if not official_ok:
+        filtered = pool_docs
+        print("[BalancedRetrieval] 신뢰도 하한 적용 시 비어 있음 → 필터 완화")
+    else:
+        filtered = official_ok
+
+    for doc in filtered:
+        div_hint = 0.35
+        if doc.get("source") == "rag" and _meta_truthy_flag(doc.get("is_official_source")):
+            div_hint = 0.75
+        elif doc.get("source") == "web" and doc.get("url"):
+            div_hint = 0.55
+        doc["diversity_score"] = div_hint
         doc["final_score"] = (
             doc.get("relevance_score", 0.5) * 0.4
             + doc.get("credibility_score", 0.5) * 0.3
@@ -352,10 +439,14 @@ def balanced_retrieval_node(state: SupervisorState) -> SupervisorState:
             + doc.get("diversity_score", 0.5) * 0.1
         )
 
-    # 정렬 후 상위 30개
-    balanced = sorted(unique_docs, key=lambda d: d["final_score"], reverse=True)[:30]
+    ranked = sorted(filtered, key=lambda d: d["final_score"], reverse=True)
+    pool = ranked[: max(MMR_POOL_SIZE, 30)]
+    balanced = mmr_select(pool, k=30)
 
-    print(f"[BalancedRetrieval] {len(docs)} → 중복제거 {len(unique_docs)} → 상위 {len(balanced)}개")
+    print(
+        f"[BalancedRetrieval] {len(docs)} → 고유 {len(unique_docs)} "
+        f"→ 필터 후 {len(filtered)} → MMR 상위 {len(balanced)}개"
+    )
     return {**state, "balanced_documents": balanced, "next_action": "balance"}
 
 
@@ -380,7 +471,7 @@ def trl_preparation_node(state: SupervisorState) -> SupervisorState:
             }
 
     for doc in docs:
-        company = doc.get("company", "")
+        company = canonical_company(str(doc.get("company", "")), companies)
         tech = doc.get("technology", "")
         content = (doc.get("content", "") + " " + doc.get("title", "")).lower()
         url = doc.get("url", "").lower()
@@ -456,16 +547,76 @@ JSON 배열로만 응답. 각 항목:
 주의: TRL 4~6 구간은 기업 비공개 영역이므로 간접 지표 기반 추정임을 trl_evidence에 명시.
 """
 
+EXTRACT_PROMPT = """
+각 문서 블록을 읽고 Task 4용 필드만 채운 JSON 배열을 출력하세요.
+필드: title, url, company, technology, research_topic, development_purpose,
+evidence_notes(기술수준·TRL 근거가 될 만한 문장), citation_line(한 줄 출처 표기)
+모르면 빈 문자열. JSON 배열만 출력.
+"""
+
+
+def _extract_structured_documents(
+    docs: List[RetrievedDocument],
+) -> List[DocumentExtraction]:
+    if not docs:
+        return []
+    blocks = []
+    for i, d in enumerate(docs):
+        body = (d.get("content") or "")[:1400]
+        blocks.append(
+            f"--- doc{i} ---\n"
+            f"title:{d.get('title','')}\nurl:{d.get('url','')}\n"
+            f"company:{d.get('company','')}\ntechnology:{d.get('technology','')}\n"
+            f"body:{body}"
+        )
+    payload = "\n".join(blocks)
+    messages = [
+        SystemMessage(content=EXTRACT_PROMPT),
+        HumanMessage(content=payload),
+    ]
+    try:
+        response = fast_llm.invoke(messages)
+        raw = response.content.strip()
+        json_str = re.search(r"\[.*\]", raw, re.DOTALL)
+        if not json_str:
+            return []
+        arr = json.loads(json_str.group())
+        out: List[DocumentExtraction] = []
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                {
+                    "title": str(item.get("title", "")),
+                    "url": str(item.get("url", "")),
+                    "company": str(item.get("company", "")),
+                    "technology": str(item.get("technology", "")),
+                    "research_topic": str(item.get("research_topic", "")),
+                    "development_purpose": str(item.get("development_purpose", "")),
+                    "evidence_notes": str(item.get("evidence_notes", "")),
+                    "citation_line": str(item.get("citation_line", "")),
+                }
+            )
+        return out
+    except Exception as e:
+        print(f"[Analyst/Extract] 구조화 추출 실패: {e}")
+        return []
+
+
 def competitive_analyst_node(state: SupervisorState) -> SupervisorState:
     docs = state.get("balanced_documents", [])
     signals = state.get("aggregated_signals", [])
     techs = state.get("target_technologies", DEFAULT_TECHNOLOGIES)
     companies = state.get("target_companies", DEFAULT_COMPANIES)
 
-    # 문서 요약 (토큰 절약)
+    extract_slice = docs[:12]
+    extractions = _extract_structured_documents(extract_slice)
+    extraction_json = json.dumps(extractions[:20], ensure_ascii=False, indent=2)
+
     doc_summary = "\n".join([
-        f"[{d.get('company','?')}/{d.get('technology','?')}] {d.get('title','')} — {d.get('content','')[:200]}"
-        for d in docs[:20]
+        f"[{d.get('company','?')}/{d.get('technology','?')}] {d.get('title','')} — "
+        f"{(d.get('content') or '')[:1200]}"
+        for d in docs[:14]
     ])
     signal_summary = json.dumps(signals[:30], ensure_ascii=False, indent=2)
 
@@ -473,7 +624,10 @@ def competitive_analyst_node(state: SupervisorState) -> SupervisorState:
 분석 대상 기업: {companies}
 분석 기술: {techs}
 
-[수집 문서 요약]
+[문서 구조화 추출 Task4]
+{extraction_json}
+
+[수집 문서 발췌]
 {doc_summary}
 
 [Signal 집계]
@@ -496,7 +650,12 @@ def competitive_analyst_node(state: SupervisorState) -> SupervisorState:
         results = []
 
     print(f"[Analyst] {len(results)}개 분석 결과 생성")
-    return {**state, "analysis_result": results, "next_action": "analyze"}
+    return {
+        **state,
+        "analysis_result": results,
+        "document_extractions": extractions,
+        "next_action": "analyze",
+    }
 
 
 # ═══════════════════════════════════════════════════════

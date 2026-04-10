@@ -66,6 +66,20 @@ class CompetitorAnalysis(TypedDict, total=False):
 
 
 # ─────────────────────────────────────────
+# Task 4 — 문서별 구조화 추출 (Analyst 입력용)
+# ─────────────────────────────────────────
+class DocumentExtraction(TypedDict, total=False):
+    title: str
+    url: str
+    company: str
+    technology: str
+    research_topic: str
+    development_purpose: str
+    evidence_notes: str
+    citation_line: str
+
+
+# ─────────────────────────────────────────
 # Validation
 # ─────────────────────────────────────────
 class ValidationState(TypedDict, total=False):
@@ -96,6 +110,7 @@ class SupervisorState(TypedDict, total=False):
 
     # ── Analysis
     analysis_result: List[CompetitorAnalysis]
+    document_extractions: List[DocumentExtraction]
 
     # ── Draft
     draft_history: List[str]
