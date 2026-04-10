@@ -1,0 +1,549 @@
+"""
+agents.py — 각 에이전트/노드 구현
+Supervisor → QueryPlanning → WebSearch + RAG(병렬) → Balanced →
+TRLPrep → CompetitiveAnalyst → DraftGeneration → Formatting
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from typing import List
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_community.tools import DuckDuckGoSearchResults
+
+from config import (
+    get_llm, get_fast_llm,
+    get_chroma_client, get_collection,
+    DEFAULT_TECHNOLOGIES, DEFAULT_COMPANIES,
+    MAX_VALIDATION_RETRY, MAX_FLOW_RETRY,
+)
+from state import (
+    SupervisorState, SearchQuery, RetrievedDocument,
+    Signal, CompetitorAnalysis, ValidationState,
+)
+
+llm = get_llm()
+fast_llm = get_fast_llm()
+search_tool = DuckDuckGoSearchResults(output_format="list", num_results=5)
+
+
+# ═══════════════════════════════════════════════════════
+# 1. Supervisor Agent
+# ═══════════════════════════════════════════════════════
+def supervisor_node(state: SupervisorState) -> SupervisorState:
+    """
+    전체 흐름 제어.
+    - 첫 진입: next_action = "plan"
+    - 각 단계 완료 후 다음 액션 결정
+    - 검증 실패 시 재시도 또는 종료
+    """
+    current = state.get("next_action", "plan")
+    retry = state.get("flow_retry_count", 0)
+
+    # 에러 누적이 임계치 초과 → 강제 종료
+    if retry >= MAX_FLOW_RETRY:
+        print("[Supervisor] 최대 재시도 초과 → 강제 종료")
+        return {**state, "next_action": "end"}
+
+    # 흐름 순서 결정
+    flow_map = {
+        "plan": "retrieve",
+        "retrieve": "balance",
+        "balance": "prepare_trl",
+        "prepare_trl": "analyze",
+        "analyze": "draft",
+        "draft": "validate",
+        "validate": _decide_after_validate(state),
+        "format": "end",
+    }
+
+    if current in flow_map:
+        next_action = flow_map[current]
+    else:
+        next_action = "end"
+
+    print(f"[Supervisor] {current} → {next_action}")
+    return {**state, "next_action": next_action}
+
+
+def _decide_after_validate(state: SupervisorState) -> str:
+    validation = state.get("validation", {})
+    if validation.get("passed", False):
+        return "format"
+    retry_count = validation.get("validation_retry_count", 0)
+    if retry_count >= MAX_VALIDATION_RETRY:
+        print("[Supervisor] 검증 재시도 초과 → format 강제 진행")
+        return "format"
+    return "draft"  # 재초안 생성
+
+
+# ═══════════════════════════════════════════════════════
+# 2. Query Planning Agent
+# ═══════════════════════════════════════════════════════
+QUERY_PLANNING_PROMPT = """
+당신은 반도체 R&D 기술 인텔리전스 전문가입니다.
+사용자 요청을 분석하여 다양한 관점의 검색 쿼리를 생성하세요.
+
+규칙:
+1. 기업 중심 / 기술 중심 / 문제·이슈 중심 쿼리를 혼합하여 확증 편향 방지
+2. 반도체 약어는 풀네임도 포함 (HBM4 → High Bandwidth Memory 4, PIM → Processing-In-Memory)
+3. 문서 유형을 활용한 우회 쿼리 포함 (논문·특허·채용공고·발표자료)
+4. web 타겟: 최신 뉴스·특허·발표 / rag 타겟: 내부 기술 기준·히스토리
+
+JSON 배열로만 응답하세요. 각 항목:
+{{"query": "...", "target": "web"|"rag", "purpose": "...", "query_type": "company"|"technology"|"issue"}}
+"""
+
+def query_planning_node(state: SupervisorState) -> SupervisorState:
+    user_query = state.get("user_query", "")
+    techs = state.get("target_technologies", DEFAULT_TECHNOLOGIES)
+    companies = state.get("target_companies", DEFAULT_COMPANIES)
+
+    prompt = f"""
+사용자 요청: {user_query}
+분석 기술: {techs}
+분석 기업: {companies}
+
+위 조건에 맞는 검색 쿼리를 최소 10개 이상 생성하세요.
+"""
+    messages = [
+        SystemMessage(content=QUERY_PLANNING_PROMPT),
+        HumanMessage(content=prompt),
+    ]
+    response = fast_llm.invoke(messages)
+    raw = response.content.strip()
+
+    # JSON 파싱
+    try:
+        json_str = re.search(r"\[.*\]", raw, re.DOTALL).group()
+        queries: List[SearchQuery] = json.loads(json_str)
+    except Exception as e:
+        print(f"[QueryPlanning] 파싱 실패: {e} → 기본 쿼리 사용")
+        queries = _default_queries(techs, companies)
+
+    print(f"[QueryPlanning] {len(queries)}개 쿼리 생성")
+    return {**state, "search_queries": queries, "next_action": "plan"}
+
+
+def _default_queries(techs: List[str], companies: List[str]) -> List[SearchQuery]:
+    queries = []
+    for tech in techs:
+        for company in companies[:3]:
+            queries.append({
+                "query": f"{company} {tech} R&D 2024 2025",
+                "target": "web",
+                "purpose": f"{company}의 {tech} 개발 동향 파악",
+                "query_type": "company",
+            })
+        queries.append({
+            "query": f"{tech} semiconductor research paper patent 2024",
+            "target": "web",
+            "purpose": f"{tech} 기술 논문·특허 현황",
+            "query_type": "technology",
+        })
+    return queries
+
+
+# ═══════════════════════════════════════════════════════
+# 3. Web Search Agent
+# ═══════════════════════════════════════════════════════
+def web_search_node(state: SupervisorState) -> SupervisorState:
+    queries = [q for q in state.get("search_queries", []) if q.get("target") == "web"]
+    existing = state.get("retrieved_documents", [])
+    new_docs: List[RetrievedDocument] = []
+
+    for q in queries:
+        try:
+            results = search_tool.invoke(q["query"])
+            if isinstance(results, str):
+                results = json.loads(results)
+            for r in results:
+                doc: RetrievedDocument = {
+                    "source": "web",
+                    "title": r.get("title", ""),
+                    "content": r.get("snippet", r.get("body", "")),
+                    "url": r.get("link", r.get("href", "")),
+                    "company": _extract_company(r.get("title", "") + r.get("snippet", ""), state),
+                    "technology": _extract_technology(r.get("title", "") + r.get("snippet", ""), state),
+                    "published_at": r.get("date", datetime.now().strftime("%Y-%m")),
+                    "relevance_score": 0.7,
+                    "credibility_score": _calc_credibility(r.get("link", "")),
+                    "freshness_score": 0.8,
+                    "diversity_score": 0.5,
+                    "final_score": 0.0,
+                }
+                new_docs.append(doc)
+        except Exception as e:
+            print(f"[WebSearch] 쿼리 실패 '{q['query']}': {e}")
+
+    print(f"[WebSearch] {len(new_docs)}개 문서 수집")
+    return {**state, "retrieved_documents": existing + new_docs, "next_action": "retrieve"}
+
+
+def _calc_credibility(url: str) -> float:
+    """신뢰도 높은 출처 판별"""
+    high_cred = ["ieee.org", "acm.org", "arxiv.org", "patent", "sec.gov",
+                 "samsung.com", "micron.com", "skhynix.com"]
+    return 0.9 if any(h in url for h in high_cred) else 0.6
+
+
+# ═══════════════════════════════════════════════════════
+# 4. RAG Agent
+# ═══════════════════════════════════════════════════════
+def rag_node(state: SupervisorState) -> SupervisorState:
+    queries = [q for q in state.get("search_queries", []) if q.get("target") == "rag"]
+    existing = state.get("retrieved_documents", [])
+    new_docs: List[RetrievedDocument] = []
+
+    try:
+        client = get_chroma_client()
+        collection = get_collection(client)
+
+        for q in queries:
+            results = collection.query(
+                query_texts=[q["query"]],
+                n_results=5,
+                include=["documents", "metadatas", "distances"],
+            )
+            for i, doc_text in enumerate(results["documents"][0]):
+                meta = results["metadatas"][0][i] if results.get("metadatas") else {}
+                distance = results["distances"][0][i] if results.get("distances") else 0.5
+                doc: RetrievedDocument = {
+                    "source": "rag",
+                    "title": meta.get("title", "내부 문서"),
+                    "content": doc_text,
+                    "url": meta.get("url", "internal"),
+                    "company": meta.get("company", ""),
+                    "technology": meta.get("technology", ""),
+                    "published_at": meta.get("published_at", ""),
+                    "relevance_score": max(0.0, 1.0 - distance),
+                    "credibility_score": 0.85,  # 내부 문서는 신뢰도 높음
+                    "freshness_score": 0.6,
+                    "diversity_score": 0.4,
+                    "final_score": 0.0,
+                }
+                new_docs.append(doc)
+    except Exception as e:
+        print(f"[RAG] ChromaDB 조회 실패: {e}")
+
+    print(f"[RAG] {len(new_docs)}개 문서 검색")
+    return {**state, "retrieved_documents": existing + new_docs, "next_action": "retrieve"}
+
+
+# ═══════════════════════════════════════════════════════
+# 5. Balanced Retrieval Node
+# ═══════════════════════════════════════════════════════
+def balanced_retrieval_node(state: SupervisorState) -> SupervisorState:
+    """
+    중복 제거 + 출처 다양성 확보 + 최신성·신뢰도 기반 재정렬
+    """
+    docs = state.get("retrieved_documents", [])
+
+    # 중복 제거 (URL 기준)
+    seen_urls = set()
+    unique_docs = []
+    for doc in docs:
+        url = doc.get("url", "")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_docs.append(doc)
+
+    # final_score 계산
+    for doc in unique_docs:
+        doc["final_score"] = (
+            doc.get("relevance_score", 0.5) * 0.4
+            + doc.get("credibility_score", 0.5) * 0.3
+            + doc.get("freshness_score", 0.5) * 0.2
+            + doc.get("diversity_score", 0.5) * 0.1
+        )
+
+    # 정렬 후 상위 30개
+    balanced = sorted(unique_docs, key=lambda d: d["final_score"], reverse=True)[:30]
+
+    print(f"[BalancedRetrieval] {len(docs)} → 중복제거 {len(unique_docs)} → 상위 {len(balanced)}개")
+    return {**state, "balanced_documents": balanced, "next_action": "balance"}
+
+
+# ═══════════════════════════════════════════════════════
+# 6. TRL Preparation Node
+# ═══════════════════════════════════════════════════════
+def trl_preparation_node(state: SupervisorState) -> SupervisorState:
+    """
+    문서에서 Signal(논문/특허/뉴스/채용) 집계 → TRL 추정 데이터 구조화
+    """
+    docs = state.get("balanced_documents", [])
+    techs = state.get("target_technologies", DEFAULT_TECHNOLOGIES)
+    companies = state.get("target_companies", DEFAULT_COMPANIES)
+
+    signal_map: dict = {}
+    for tech in techs:
+        for company in companies:
+            key = f"{company}_{tech}"
+            signal_map[key] = {
+                "company": company, "technology": tech,
+                "paper": 0, "patent": 0, "news": 0, "job": 0,
+            }
+
+    for doc in docs:
+        company = doc.get("company", "")
+        tech = doc.get("technology", "")
+        content = (doc.get("content", "") + " " + doc.get("title", "")).lower()
+        url = doc.get("url", "").lower()
+
+        if not company or not tech:
+            continue
+        key = f"{company}_{tech}"
+        if key not in signal_map:
+            signal_map[key] = {
+                "company": company, "technology": tech,
+                "paper": 0, "patent": 0, "news": 0, "job": 0,
+            }
+
+        if any(k in url for k in ["arxiv", "ieee", "acm", "scholar"]):
+            signal_map[key]["paper"] += 1
+        elif any(k in url for k in ["patent", "uspto", "kipris"]):
+            signal_map[key]["patent"] += 1
+        elif any(k in content for k in ["채용", "job", "hiring", "engineer wanted"]):
+            signal_map[key]["job"] += 1
+        else:
+            signal_map[key]["news"] += 1
+
+    signals: List[Signal] = []
+    for key, s in signal_map.items():
+        total = s["paper"] + s["patent"] + s["news"] + s["job"]
+        trend = "increasing" if total >= 3 else ("stable" if total >= 1 else "decreasing")
+        for stype in ["paper", "patent", "news", "job"]:
+            if s[stype] > 0:
+                signals.append({
+                    "company": s["company"],
+                    "technology": s["technology"],
+                    "signal_type": stype,
+                    "count": s[stype],
+                    "trend": trend,
+                })
+
+    print(f"[TRLPrep] {len(signals)}개 Signal 생성")
+    return {**state, "aggregated_signals": signals, "next_action": "prepare_trl"}
+
+
+# ═══════════════════════════════════════════════════════
+# 7. Competitive Analyst Agent
+# ═══════════════════════════════════════════════════════
+ANALYST_PROMPT = """
+당신은 반도체 기술 전략 분석 전문가입니다.
+수집된 문서와 Signal을 바탕으로 아래 항목을 분석하세요.
+
+분석 항목:
+1. trend_summary: 해당 기업-기술 조합의 최신 개발 방향 요약 (3~5문장)
+2. trl_level: TRL 1~9 추정 (간접 지표 기반, 4~6은 추정임을 인지)
+3. trl_evidence: TRL 추정 근거 목록 (최소 2개)
+4. threat_level: "HIGH" | "MEDIUM" | "LOW"
+5. key_findings: 핵심 발견사항 목록 (최소 3개)
+6. source_urls: 참고 URL 목록
+
+JSON 배열로만 응답. 각 항목:
+{{"company":"...", "technology":"...", "trend_summary":"...",
+  "trl_level":5, "trl_evidence":["..."], "threat_level":"HIGH",
+  "key_findings":["..."], "source_urls":["..."]}}
+
+주의: TRL 4~6 구간은 기업 비공개 영역이므로 간접 지표 기반 추정임을 trl_evidence에 명시.
+"""
+
+def competitive_analyst_node(state: SupervisorState) -> SupervisorState:
+    docs = state.get("balanced_documents", [])
+    signals = state.get("aggregated_signals", [])
+    techs = state.get("target_technologies", DEFAULT_TECHNOLOGIES)
+    companies = state.get("target_companies", DEFAULT_COMPANIES)
+
+    # 문서 요약 (토큰 절약)
+    doc_summary = "\n".join([
+        f"[{d.get('company','?')}/{d.get('technology','?')}] {d.get('title','')} — {d.get('content','')[:200]}"
+        for d in docs[:20]
+    ])
+    signal_summary = json.dumps(signals[:30], ensure_ascii=False, indent=2)
+
+    prompt = f"""
+분석 대상 기업: {companies}
+분석 기술: {techs}
+
+[수집 문서 요약]
+{doc_summary}
+
+[Signal 집계]
+{signal_summary}
+
+위 데이터를 기반으로 기업별·기술별 분석 결과를 생성하세요.
+"""
+    messages = [
+        SystemMessage(content=ANALYST_PROMPT),
+        HumanMessage(content=prompt),
+    ]
+    response = llm.invoke(messages)
+    raw = response.content.strip()
+
+    try:
+        json_str = re.search(r"\[.*\]", raw, re.DOTALL).group()
+        results: List[CompetitorAnalysis] = json.loads(json_str)
+    except Exception as e:
+        print(f"[Analyst] 파싱 실패: {e}")
+        results = []
+
+    print(f"[Analyst] {len(results)}개 분석 결과 생성")
+    return {**state, "analysis_result": results, "next_action": "analyze"}
+
+
+# ═══════════════════════════════════════════════════════
+# 8. Draft Generation Agent
+# ═══════════════════════════════════════════════════════
+DRAFT_PROMPT = """
+당신은 기술 전략 보고서 작성 전문가입니다.
+아래 분석 결과를 바탕으로 전략 보고서 초안을 작성하세요.
+
+보고서 구조:
+- SUMMARY: 핵심 분석 결과 요약 / 주요 경쟁사 전략 정리
+- 1장. 분석 배경: HBM 시장 현황 / 차세대 기술 전략적 중요성
+- 2장. 기술 현황: HBM4·PIM·CXL 개요 / 한계 및 발전 방향
+- 3장. 경쟁사 동향 분석: 기업별 상세 분석 및 근거 제시
+- 4장. 기술 성숙도 및 경쟁 비교: TRL 분석 / 포지션 비교 매트릭스
+- 5장. 전략적 시사점: 위협·기회 요소 / 대응 전략 제안
+- REFERENCE: 출처 목록 (하이퍼링크 포함)
+- 분석 한계 고지 (TRL 4~6 간접 지표 기반 추정 명시)
+
+마크다운 형식으로 작성.
+"""
+
+def draft_generation_node(state: SupervisorState) -> SupervisorState:
+    analysis = state.get("analysis_result", [])
+    validation = state.get("validation", {})
+    history = state.get("draft_history", [])
+    retry_count = validation.get("validation_retry_count", 0)
+
+    feedback_section = ""
+    if retry_count > 0:
+        feedback_section = f"\n[이전 검증 피드백]\n{validation.get('feedback', '')}\n위 피드백을 반영하여 개선하세요."
+
+    prompt = f"""
+분석 결과:
+{json.dumps(analysis, ensure_ascii=False, indent=2)[:4000]}
+{feedback_section}
+
+위 내용을 바탕으로 전략 보고서 초안을 작성하세요.
+"""
+    messages = [
+        SystemMessage(content=DRAFT_PROMPT),
+        HumanMessage(content=prompt),
+    ]
+    response = llm.invoke(messages)
+    draft = response.content
+
+    print(f"[DraftGen] 초안 생성 완료 ({len(draft)}자) / 재시도: {retry_count}")
+    return {
+        **state,
+        "current_draft": draft,
+        "draft_history": history + [draft],
+        "next_action": "draft",
+    }
+
+
+# ═══════════════════════════════════════════════════════
+# 9. Validation (검증 노드)
+# ═══════════════════════════════════════════════════════
+VALIDATION_PROMPT = """
+당신은 기술 보고서 품질 검토자입니다. 아래 기준으로 보고서를 평가하세요.
+
+검증 기준:
+1. 모든 필수 섹션(SUMMARY, 1~5장, REFERENCE) 포함 여부
+2. 기업별 분석에 근거 자료(출처) 포함 여부
+3. TRL 추정 시 한계 고지 여부
+4. 전략적 시사점의 구체성 (단순 나열이 아닌 실행 가능한 제안)
+5. 비교 가능한 형태(매트릭스 또는 표)로 기업 비교 포함 여부
+
+JSON으로 응답:
+{{"passed": true|false, "feedback": "개선 사항 구체적으로..."}}
+"""
+
+def validation_node(state: SupervisorState) -> SupervisorState:
+    draft = state.get("current_draft", "")
+    validation = state.get("validation", {})
+    retry_count = validation.get("validation_retry_count", 0)
+
+    messages = [
+        SystemMessage(content=VALIDATION_PROMPT),
+        HumanMessage(content=f"보고서 초안:\n{draft[:5000]}"),
+    ]
+    response = fast_llm.invoke(messages)
+    raw = response.content.strip()
+
+    try:
+        json_str = re.search(r"\{.*\}", raw, re.DOTALL).group()
+        result = json.loads(json_str)
+    except Exception:
+        result = {"passed": True, "feedback": "파싱 실패 — 기본 통과"}
+
+    new_validation: ValidationState = {
+        "passed": result.get("passed", True),
+        "feedback": result.get("feedback", ""),
+        "validation_retry_count": retry_count + (0 if result.get("passed") else 1),
+    }
+    status = "통과" if new_validation["passed"] else f"실패 (재시도 {new_validation['validation_retry_count']})"
+    print(f"[Validation] {status}")
+    return {**state, "validation": new_validation, "next_action": "validate"}
+
+
+# ═══════════════════════════════════════════════════════
+# 10. Formatting Node
+# ═══════════════════════════════════════════════════════
+def formatting_node(state: SupervisorState) -> SupervisorState:
+    """
+    최종 보고서 형식 통일 + 헤더/날짜/분석 한계 고지 추가
+    """
+    draft = state.get("current_draft", "")
+    companies = state.get("target_companies", [])
+    techs = state.get("target_technologies", [])
+    today = datetime.now().strftime("%Y년 %m월 %d일")
+
+    header = f"""# 반도체 R&D 기술 전략 분석 보고서
+
+> **분석 대상 기업:** {', '.join(companies)}
+> **분석 기술:** {', '.join(techs)}
+> **작성일:** {today}
+> **분석 도구:** AI 에이전트 시스템 (Web Search + RAG)
+
+---
+
+"""
+    disclaimer = """
+
+---
+
+> **⚠️ 분석 한계 고지**
+> TRL 4~6 구간은 기업 비공개 영역으로, 본 보고서의 기술 성숙도 평가는
+> 특허 출원 수·논문 발표 빈도·채용 공고 키워드 등 **간접 지표 기반 추정**입니다.
+> 직접적인 기술 수준 확인이 아님을 명시합니다.
+"""
+    final_report = header + draft + disclaimer
+
+    print(f"[Formatting] 최종 보고서 완성 ({len(final_report)}자)")
+    return {**state, "final_report": final_report, "next_action": "format"}
+
+
+# ═══════════════════════════════════════════════════════
+# 헬퍼 함수
+# ═══════════════════════════════════════════════════════
+def _extract_company(text: str, state: SupervisorState) -> str:
+    companies = state.get("target_companies", DEFAULT_COMPANIES)
+    text_lower = text.lower()
+    for c in companies:
+        if c.lower() in text_lower:
+            return c
+    return ""
+
+def _extract_technology(text: str, state: SupervisorState) -> str:
+    techs = state.get("target_technologies", DEFAULT_TECHNOLOGIES)
+    text_lower = text.lower()
+    for t in techs:
+        if t.lower() in text_lower:
+            return t
+    return ""
