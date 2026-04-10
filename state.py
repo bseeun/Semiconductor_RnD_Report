@@ -27,6 +27,12 @@ class RetrievedDocument(TypedDict, total=False):
     company: str
     technology: str
     published_at: str
+    source_type: str
+    publisher: str
+    is_official_source: str  # "true" | "false" (Chroma 메타데이터와 동일)
+    doc_id: str
+    chunk_index: int
+    trl_aggregation_key: str
     relevance_score: float
     credibility_score: float  # 신뢰도 (balance 판단)
     freshness_score: float    # 최신성

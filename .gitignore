@@ -1,1 +1,39 @@
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+
+# ChromaDB (로컬 영속 볼륨)
+chroma_db/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 실행 산출물 (필요하면 reports/ 줄 주석 처리)
+reports/*.md
+
+# 대용량 원문 (폴더 구조만 유지하려면 PDF는 제외)
+docs/pdfs/*.pdf

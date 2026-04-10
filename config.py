@@ -9,6 +9,22 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 
 load_dotenv()
 
+# Hugging Face Hub: HF_TOKEN(또는 HUGGINGFACE_HUB_TOKEN)이 있으면 인증 다운로드로
+# rate limit이 올라가고 대용량 가중치 받기가 훨씬 빨라짐(무료 계정 토큰으로 가능).
+# https://huggingface.co/settings/tokens
+_hf = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+if _hf:
+    os.environ.setdefault("HF_TOKEN", _hf.strip())
+    os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", _hf.strip())
+
+# 선택: pip install hf_transfer 후 대용량 파일 고속 전송
+try:
+    import hf_transfer  # noqa: F401
+
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+except ImportError:
+    pass
+
 # ─────────────────────────────────────────
 # LLM
 # ─────────────────────────────────────────

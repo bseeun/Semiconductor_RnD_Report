@@ -29,6 +29,54 @@ fast_llm = get_fast_llm()
 search_tool = DuckDuckGoSearchResults(output_format="list", num_results=5)
 
 
+def _meta_truthy_flag(val) -> bool:
+    if isinstance(val, bool):
+        return val
+    return str(val).lower() in ("1", "true", "yes")
+
+
+def _credibility_from_rag_meta(meta: dict) -> float:
+    if _meta_truthy_flag(meta.get("is_official_source")):
+        return 0.92
+    st = (meta.get("source_type") or "").lower()
+    if st in ("standard", "patent"):
+        return 0.88
+    if st in ("paper", "whitepaper", "ir_report"):
+        return 0.82
+    return 0.74
+
+
+def _freshness_from_published_at(pub: str) -> float:
+    if not pub or len(pub) < 7:
+        return 0.55
+    try:
+        y, m = int(pub[:4]), int(pub[5:7])
+        doc_dt = datetime(y, m, 1)
+        months = (datetime.now() - doc_dt).days / 30.44
+        return max(0.25, min(1.0, 1.0 - min(months, 48) * 0.018))
+    except Exception:
+        return 0.55
+
+
+def _chunk_index_from_meta(meta: dict) -> int:
+    v = meta.get("chunk_index", 0)
+    if v is None:
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _retrieval_dedup_key(doc: RetrievedDocument) -> tuple:
+    if doc.get("source") == "rag" and doc.get("doc_id"):
+        return ("rag", doc["doc_id"], str(doc.get("chunk_index", 0)))
+    u = (doc.get("url") or "").strip()
+    if u:
+        return ("web", u)
+    return ("web", "__nourl__", id(doc))
+
+
 # ═══════════════════════════════════════════════════════
 # 1. Supervisor Agent
 # ═══════════════════════════════════════════════════════
@@ -91,6 +139,7 @@ QUERY_PLANNING_PROMPT = """
 2. 반도체 약어는 풀네임도 포함 (HBM4 → High Bandwidth Memory 4, PIM → Processing-In-Memory)
 3. 문서 유형을 활용한 우회 쿼리 포함 (논문·특허·채용공고·발표자료)
 4. web 타겟: 최신 뉴스·특허·발표 / rag 타겟: 내부 기술 기준·히스토리
+5. **반드시 `target`이 \"rag\"인 쿼리를 최소 4개 포함** (ChromaDB 내부 PDF·표준 문서 검색용)
 
 JSON 배열로만 응답하세요. 각 항목:
 {{"query": "...", "target": "web"|"rag", "purpose": "...", "query_type": "company"|"technology"|"issue"}}
@@ -123,8 +172,44 @@ def query_planning_node(state: SupervisorState) -> SupervisorState:
         print(f"[QueryPlanning] 파싱 실패: {e} → 기본 쿼리 사용")
         queries = _default_queries(techs, companies)
 
+    queries = _ensure_rag_queries(queries, techs, companies)
+
     print(f"[QueryPlanning] {len(queries)}개 쿼리 생성")
     return {**state, "search_queries": queries, "next_action": "plan"}
+
+
+def _default_rag_queries(techs: List[str], companies: List[str]) -> List[SearchQuery]:
+    """LLM이 rag 쿼리를 안 주거나 파싱 실패 시 Chroma 검색용 보강"""
+    out: List[SearchQuery] = []
+    for tech in techs:
+        out.append(
+            {
+                "query": f"{tech} HBM CXL PIM memory standard JEDEC whitepaper specification",
+                "target": "rag",
+                "purpose": f"{tech} 관련 내부·표준·백서 청크 검색",
+                "query_type": "technology",
+            }
+        )
+    for company in companies:
+        compact = company.replace(" ", "")
+        out.append(
+            {
+                "query": f"{company} {compact} IR report whitepaper CXL HBM PIM semiconductor",
+                "target": "rag",
+                "purpose": f"{company} 내부 성격 문서 검색",
+                "query_type": "company",
+            }
+        )
+    return out
+
+
+def _ensure_rag_queries(
+    queries: List[SearchQuery], techs: List[str], companies: List[str]
+) -> List[SearchQuery]:
+    if any(q.get("target") == "rag" for q in queries):
+        return queries
+    print("[QueryPlanning] rag 타겟 쿼리 없음 → 기본 RAG 쿼리 자동 추가")
+    return queries + _default_rag_queries(techs, companies)
 
 
 def _default_queries(techs: List[str], companies: List[str]) -> List[SearchQuery]:
@@ -143,6 +228,7 @@ def _default_queries(techs: List[str], companies: List[str]) -> List[SearchQuery
             "purpose": f"{tech} 기술 논문·특허 현황",
             "query_type": "technology",
         })
+    queries.extend(_default_rag_queries(techs, companies))
     return queries
 
 
@@ -210,6 +296,7 @@ def rag_node(state: SupervisorState) -> SupervisorState:
             for i, doc_text in enumerate(results["documents"][0]):
                 meta = results["metadatas"][0][i] if results.get("metadatas") else {}
                 distance = results["distances"][0][i] if results.get("distances") else 0.5
+                pub = meta.get("published_at") or ""
                 doc: RetrievedDocument = {
                     "source": "rag",
                     "title": meta.get("title", "내부 문서"),
@@ -217,10 +304,16 @@ def rag_node(state: SupervisorState) -> SupervisorState:
                     "url": meta.get("url", "internal"),
                     "company": meta.get("company", ""),
                     "technology": meta.get("technology", ""),
-                    "published_at": meta.get("published_at", ""),
+                    "published_at": pub,
+                    "source_type": meta.get("source_type", ""),
+                    "publisher": meta.get("publisher", ""),
+                    "is_official_source": str(meta.get("is_official_source", "false")),
+                    "doc_id": meta.get("doc_id", ""),
+                    "chunk_index": _chunk_index_from_meta(meta),
+                    "trl_aggregation_key": meta.get("trl_aggregation_key", ""),
                     "relevance_score": max(0.0, 1.0 - distance),
-                    "credibility_score": 0.85,  # 내부 문서는 신뢰도 높음
-                    "freshness_score": 0.6,
+                    "credibility_score": _credibility_from_rag_meta(meta),
+                    "freshness_score": _freshness_from_published_at(pub),
                     "diversity_score": 0.4,
                     "final_score": 0.0,
                 }
@@ -241,14 +334,14 @@ def balanced_retrieval_node(state: SupervisorState) -> SupervisorState:
     """
     docs = state.get("retrieved_documents", [])
 
-    # 중복 제거 (URL 기준)
-    seen_urls = set()
-    unique_docs = []
+    seen: set[tuple] = set()
+    unique_docs: List[RetrievedDocument] = []
     for doc in docs:
-        url = doc.get("url", "")
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            unique_docs.append(doc)
+        key = _retrieval_dedup_key(doc)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_docs.append(doc)
 
     # final_score 계산
     for doc in unique_docs:
@@ -291,6 +384,7 @@ def trl_preparation_node(state: SupervisorState) -> SupervisorState:
         tech = doc.get("technology", "")
         content = (doc.get("content", "") + " " + doc.get("title", "")).lower()
         url = doc.get("url", "").lower()
+        stype = (doc.get("source_type") or "").lower()
 
         if not company or not tech:
             continue
@@ -300,6 +394,17 @@ def trl_preparation_node(state: SupervisorState) -> SupervisorState:
                 "company": company, "technology": tech,
                 "paper": 0, "patent": 0, "news": 0, "job": 0,
             }
+
+        if doc.get("source") == "rag" and stype:
+            if stype in ("paper", "whitepaper"):
+                signal_map[key]["paper"] += 1
+                continue
+            if stype == "patent":
+                signal_map[key]["patent"] += 1
+                continue
+            if stype in ("ir_report", "standard"):
+                signal_map[key]["news"] += 1
+                continue
 
         if any(k in url for k in ["arxiv", "ieee", "acm", "scholar"]):
             signal_map[key]["paper"] += 1
@@ -412,6 +517,7 @@ DRAFT_PROMPT = """
 - 분석 한계 고지 (TRL 4~6 간접 지표 기반 추정 명시)
 
 마크다운 형식으로 작성.
+언어는 한국어로 작성.
 """
 
 def draft_generation_node(state: SupervisorState) -> SupervisorState:
