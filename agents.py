@@ -6,12 +6,14 @@ TRLPrep → CompetitiveAnalyst(Task4추출) → Draft → Validation → Formatt
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime
-from typing import List
+from typing import Any, List
+from urllib.parse import urlparse
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_community.tools import DuckDuckGoSearchResults
+from langchain_tavily import TavilySearch
 
 from config import (
     get_llm, get_fast_llm,
@@ -39,7 +41,84 @@ from retrieval_utils import (
 
 llm = get_llm()
 fast_llm = get_fast_llm()
-search_tool = DuckDuckGoSearchResults(output_format="list", num_results=5)
+
+_tavily_search: TavilySearch | None = None
+
+
+def _get_tavily_search() -> TavilySearch:
+    """TAVILY_API_KEY 검증이 있어 모듈 import 시점이 아니라 첫 웹 검색 시 생성."""
+    global _tavily_search
+    if _tavily_search is None:
+        _tavily_search = TavilySearch(max_results=5, search_depth="basic")
+    return _tavily_search
+
+
+def _normalize_web_published(raw: Any) -> str:
+    """Tavily published_date 등 → YYYY-MM-DD 또는 YYYY-MM. 없으면 빈 문자열."""
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    s = s.replace("Z", "").replace("T", " ")
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    if len(s) >= 7 and s[4] == "-":
+        return s[:7]
+    return s[:32]
+
+
+def _publisher_from_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
+
+
+def _tavily_fetch_results(query: str, state: SupervisorState) -> list[dict[str, Any]]:
+    """
+    tool.invoke 대신 api_wrapper.raw_results 로 원본 results 를 받아
+    published_date 등 메타를 유지 (langchain-tavily / Bearer 인증).
+    """
+    tool = _get_tavily_search()
+    w = tool.api_wrapper
+    scope = state.get("scope") or {}
+    date_from, date_to = parse_scope_dates(scope)
+    start_s = date_from.strftime("%Y-%m-%d") if date_from else None
+    end_s = date_to.strftime("%Y-%m-%d") if date_to else None
+
+    topic: Any = tool.topic if tool.topic is not None else "general"
+    env_topic = os.getenv("TAVILY_TOPIC", "").strip().lower()
+    if env_topic in ("general", "news", "finance"):
+        topic = env_topic
+
+    raw = w.raw_results(
+        query=query,
+        max_results=tool.max_results if tool.max_results is not None else 5,
+        search_depth=tool.search_depth if tool.search_depth is not None else "basic",
+        include_domains=tool.include_domains,
+        exclude_domains=tool.exclude_domains,
+        include_answer=tool.include_answer if tool.include_answer is not None else False,
+        include_raw_content=tool.include_raw_content
+        if tool.include_raw_content is not None
+        else False,
+        include_images=tool.include_images if tool.include_images is not None else False,
+        include_image_descriptions=tool.include_image_descriptions,
+        include_favicon=tool.include_favicon,
+        topic=topic,
+        time_range=tool.time_range,
+        country=tool.country,
+        auto_parameters=tool.auto_parameters,
+        start_date=start_s,
+        end_date=end_s,
+        include_usage=tool.include_usage,
+    )
+    return list(raw.get("results") or [])
 
 
 def _meta_truthy_flag(val) -> bool:
@@ -260,30 +339,41 @@ def collect_web_documents(state: SupervisorState) -> List[RetrievedDocument]:
 
     for q in queries:
         try:
-            results = search_tool.invoke(q["query"])
-            if isinstance(results, str):
-                results = json.loads(results)
+            results = _tavily_fetch_results(q["query"], state)
             for r in results:
-                co = _extract_company(r.get("title", "") + r.get("snippet", ""), state)
+                body = (r.get("content") or r.get("snippet") or r.get("body") or "")
+                url = (r.get("url") or r.get("link") or r.get("href") or "").strip()
+                pub = _normalize_web_published(
+                    r.get("published_date")
+                    or r.get("publishedDate")
+                    or r.get("date")
+                )
+                score = r.get("score")
+                rel = float(score) if isinstance(score, (int, float)) else 0.7
+                co = _extract_company(r.get("title", "") + body, state)
                 doc: RetrievedDocument = {
                     "source": "web",
-                    "title": r.get("title", ""),
-                    "content": r.get("snippet", r.get("body", "")),
-                    "url": r.get("link", r.get("href", "")),
+                    "title": (r.get("title") or "")[:500],
+                    "content": body,
+                    "url": url,
                     "company": canonical_company(co, targets) if co else "",
                     "technology": _extract_technology(
-                        r.get("title", "") + r.get("snippet", ""), state
+                        r.get("title", "") + body, state
                     ),
-                    "published_at": r.get("date", datetime.now().strftime("%Y-%m")),
-                    "relevance_score": 0.7,
-                    "credibility_score": _calc_credibility(r.get("link", "")),
-                    "freshness_score": 0.8,
+                    "published_at": pub,
+                    "source_type": "web",
+                    "publisher": _publisher_from_url(url),
+                    "relevance_score": rel,
+                    "credibility_score": _calc_credibility(url),
+                    "freshness_score": _freshness_from_published_at(pub)
+                    if pub
+                    else 0.55,
                     "diversity_score": 0.5,
                     "final_score": 0.0,
                 }
                 new_docs.append(doc)
         except Exception as e:
-            print(f"[WebSearch] 쿼리 실패 '{q['query']}': {e}")
+            print(f"[Tavily] 쿼리 실패 '{q['query']}': {e}")
 
     return new_docs
 
@@ -291,7 +381,7 @@ def collect_web_documents(state: SupervisorState) -> List[RetrievedDocument]:
 def web_search_node(state: SupervisorState) -> SupervisorState:
     existing = state.get("retrieved_documents", [])
     new_docs = collect_web_documents(state)
-    print(f"[WebSearch] {len(new_docs)}개 문서 수집")
+    print(f"[Tavily] {len(new_docs)}개 문서 수집")
     return {**state, "retrieved_documents": existing + new_docs, "next_action": "retrieve"}
 
 
@@ -472,7 +562,9 @@ def trl_preparation_node(state: SupervisorState) -> SupervisorState:
 
     for doc in docs:
         company = canonical_company(str(doc.get("company", "")), companies)
-        tech = doc.get("technology", "")
+        # tech = doc.get("technology", "")
+        if not tech:
+            tech = _extract_technology(content, state)
         content = (doc.get("content", "") + " " + doc.get("title", "")).lower()
         url = doc.get("url", "").lower()
         stype = (doc.get("source_type") or "").lower()
@@ -528,30 +620,58 @@ def trl_preparation_node(state: SupervisorState) -> SupervisorState:
 # 7. Competitive Analyst Agent
 # ═══════════════════════════════════════════════════════
 ANALYST_PROMPT = """
-당신은 반도체 기술 전략 분석 전문가입니다.
-수집된 문서와 Signal을 바탕으로 아래 항목을 분석하세요.
+당신은 반도체 기술 전략 분석 전문가입니다. 아래의 [TRL 판정 기준]과 [정보 공개 패턴]을 참조하여 수집된 데이터를 분석하고 JSON 배열로 응답하세요.
 
-분석 항목:
-1. trend_summary: 해당 기업-기술 조합의 최신 개발 방향 요약 (3~5문장)
-2. trl_level: TRL 1~9 추정 (간접 지표 기반, 4~6은 추정임을 인지)
-3. trl_evidence: TRL 추정 근거 목록 (최소 2개)
-4. threat_level: "HIGH" | "MEDIUM" | "LOW"
-5. key_findings: 핵심 발견사항 목록 (최소 3개)
-6. source_urls: 참고 URL 목록
+[TRL 9단계 판정 기준]
+1. TRL 1~2: 기초 원리 관찰, 아이디어/이론 수준
+2. TRL 3: 개념 검증, 실험실 수준 실증
+3. TRL 4: 부품 검증, 실험실 환경 통합
+4. TRL 5: 부품 검증(실환경), 유사 환경 통합 테스트
+5. TRL 6: 시스템 시연, 실제 환경 유사 조건 시연
+6. TRL 7: 시스템 시제품, 실제 운용 환경 시연 (샘플 공급)
+7. TRL 8: 시스템 완성, 양산 적합성 검증 완료
+8. TRL 9: 실제 운용, 상용 양산 및 납품
 
-JSON 배열로만 응답. 각 항목:
-{{"company":"...", "technology":"...", "trend_summary":"...",
-  "trl_level":5, "trl_evidence":["..."], "threat_level":"HIGH",
-  "key_findings":["..."], "source_urls":["..."]}}
+[정보 공개 패턴 분석 지침]
+- TRL 1~3: 논문, 학회, 특허 출원 등 공개 활동 활발 (인재 채용, 투자 유치 목적)
+- TRL 4~6 (GAP 구간): 수율, 공정 파라미터 등 영업 비밀로 인해 정보가 극도로 제한됨. 과거 활동 대비 침묵이 길어지면 이 구간으로 추정.
+- TRL 7~9: 고객사 샘플 공급, 양산 발표, IR 실적 공시 등 비즈니스 목적으로 다시 정보 공개 시작.
+
+[분석 항목 및 출력 형식]
+반드시 아래 키워드를 가진 JSON 배열로만 응답하세요:
+{
+  "company": "기업명",
+  "technology": "기술명",
+  "trend_summary": "최신 개발 방향 요약 (3~5문장)",
+  "trl_level": 추정 숫자 (1~9),
+  "trl_evidence": ["단계 판정 근거 1", "단계 판정 근거 2"],
+  "information_gap_analysis": "4~6단계를 포함한 정보 노출 패턴 분석 결과",
+  "threat_level": "HIGH" | "MEDIUM" | "LOW",
+  "key_findings": ["핵심 발견사항 3개 이상"],
+  "source_urls": ["참고 URL"]
+}
 
 주의: TRL 4~6 구간은 기업 비공개 영역이므로 간접 지표 기반 추정임을 trl_evidence에 명시.
+- source_urls는 반드시 입력 데이터(documents)에 존재하는 URL만 사용
 """
 
 EXTRACT_PROMPT = """
-각 문서 블록을 읽고 Task 4용 필드만 채운 JSON 배열을 출력하세요.
-필드: title, url, company, technology, research_topic, development_purpose,
-evidence_notes(기술수준·TRL 근거가 될 만한 문장), citation_line(한 줄 출처 표기)
-모르면 빈 문자열. JSON 배열만 출력.
+당신은 반도체 문서 데이터 추출기입니다. 각 문서 블록을 읽고 아래 필드를 채운 JSON 배열을 출력하세요.
+
+[필드 정의]
+- title: 문서 제목
+- url: 문서 주소
+- company: 대상 기업
+- technology: 대상 기술
+- research_topic: 구체적 연구 주제
+- development_purpose: 기술 개발 목적 (PPA 개선 등)
+- evidence_notes: TRL 판정 근거 (예: 수율 언급, 샘플 공급, 학회 발표 여부 등)
+- citation_line: 한 줄 출처 (예: [작성자/매체, 연도])
+
+[길이 가이드]
+- research_topic: 최소 1문장(20자 이상), 가능하면 2문장
+- development_purpose: 최소 1문장(25자 이상)
+- evidence_notes: 최소 2문장(40자 이상), 근거 키워드 2개 이상 포함
 """
 
 
@@ -562,7 +682,7 @@ def _extract_structured_documents(
         return []
     blocks = []
     for i, d in enumerate(docs):
-        body = (d.get("content") or "")[:1400]
+        body = (d.get("content") or "")[:2600]
         blocks.append(
             f"--- doc{i} ---\n"
             f"title:{d.get('title','')}\nurl:{d.get('url','')}\n"
@@ -609,14 +729,14 @@ def competitive_analyst_node(state: SupervisorState) -> SupervisorState:
     techs = state.get("target_technologies", DEFAULT_TECHNOLOGIES)
     companies = state.get("target_companies", DEFAULT_COMPANIES)
 
-    extract_slice = docs[:12]
+    extract_slice = docs[:20]
     extractions = _extract_structured_documents(extract_slice)
-    extraction_json = json.dumps(extractions[:20], ensure_ascii=False, indent=2)
+    extraction_json = json.dumps(extractions[:30], ensure_ascii=False, indent=2)
 
     doc_summary = "\n".join([
         f"[{d.get('company','?')}/{d.get('technology','?')}] {d.get('title','')} — "
-        f"{(d.get('content') or '')[:1200]}"
-        for d in docs[:14]
+        f"{(d.get('content') or '')[:2200]}"
+        for d in docs[:20]
     ])
     signal_summary = json.dumps(signals[:30], ensure_ascii=False, indent=2)
 
@@ -662,21 +782,110 @@ def competitive_analyst_node(state: SupervisorState) -> SupervisorState:
 # 8. Draft Generation Agent
 # ═══════════════════════════════════════════════════════
 DRAFT_PROMPT = """
-당신은 기술 전략 보고서 작성 전문가입니다.
-아래 분석 결과를 바탕으로 전략 보고서 초안을 작성하세요.
+당신은 SK hynix의 R&D 전략 담당자에게 보고하는 기술 전략 보고서 작성 전문가입니다.
+반드시 "SK hynix 기준에서 경쟁사를 평가하고 대응 전략을 도출"하는 관점으로 작성하세요.
 
-보고서 구조:
-- SUMMARY: 핵심 분석 결과 요약 / 주요 경쟁사 전략 정리
-- 1장. 분석 배경: HBM 시장 현황 / 차세대 기술 전략적 중요성
-- 2장. 기술 현황: HBM4·PIM·CXL 개요 / 한계 및 발전 방향
-- 3장. 경쟁사 동향 분석: 기업별 상세 분석 및 근거 제시
-- 4장. 기술 성숙도 및 경쟁 비교: TRL 분석 / 포지션 비교 매트릭스
-- 5장. 전략적 시사점: 위협·기회 요소 / 대응 전략 제안
-- REFERENCE: 출처 목록 (하이퍼링크 포함)
-- 분석 한계 고지 (TRL 4~6 간접 지표 기반 추정 명시)
+[핵심 작성 원칙]
+- SK hynix를 기준으로 경쟁사 기술 수준과 위협도를 비교 분석
+- 단순 설명이 아닌 "정량적 지표 + 근거" 중심으로 작성
+- 수치가 없을 경우: "데이터 부족" 또는 "추정"이라고 명시
+- 경쟁사 분석은 반드시 기업별로 분리
+- TRL은 반드시 근거 기반으로 추정 (추정 여부 명시)
+- REFERENCE에는 실제 URL 포함
+- 전체 한국어 작성
+- 반드시 아래 목차 구조와 동일한 마크다운 헤더 사용 (변형 금지)
+- 분량을 충분히 확보할 것: 전체 본문(REFERENCE 제외) 최소 2,000자 이상
+- 각 장은 최소 2개 이상의 문단 또는 4개 이상의 불릿으로 작성
+- 3장/5장은 특히 상세히 작성: 기업별 근거와 대응 전략을 각각 최소 2문단 이상 제시
 
-마크다운 형식으로 작성.
-언어는 한국어로 작성.
+---
+
+## SUMMARY
+
+- 전체 분석 결과를 1/2 페이지 이내로 요약
+- 주요 경쟁사(삼성전자, 마이크론 등)와의 격차를 정량적으로 비교
+- 핵심 위협 요소 및 기회 요소를 수치 기반으로 요약
+
+---
+
+## 1장. 분석 배경
+
+- HBM 시장 규모, CAGR, 주요 기업 점유율 (SK hynix 포함) 제시
+- 왜 지금 HBM4/PIM/CXL 분석이 중요한지:
+  → AI 시장 성장률, GPU 수요 증가 등 데이터 기반 설명
+
+---
+
+## 2장. 기술 현황
+
+- HBM4, PIM, CXL 각각에 대해:
+  - 성능 지표 (대역폭, 전력 효율 등)
+  - 기존 HBM3E 대비 개선 수치
+- 기술 한계 (발열, 수율, 비용 등)도 가능하면 정량적으로 표현
+
+---
+
+## 3장. 경쟁사 동향 분석
+
+대상 기업:
+- TRL 레벨이 높은 기업들을 대상으로 분석
+
+각 기업별 필수 포함 요소:
+- SK hynix 대비 기술 격차 (성능, 제품 출시 여부 등)
+- R&D 투자 규모 / CAPEX / 비율
+- 특허 수 / 논문 수 / 최근 발표 건수
+- 제품 양산 여부 또는 샘플 공급 단계
+- 채용 공고 수 또는 기술 키워드 등장 빈도
+- 기술 방향 (예: PIM 집중, CXL 연계 등)
+
+→ 반드시 "SK hynix 대비 위협 수준"을 명시 (높음/중간/낮음 + 근거)
+
+---
+
+## 4장. 기술 성숙도 및 경쟁 비교
+
+- 기업별 TRL 수준 명시 (숫자 필수)
+- TRL 판단 근거:
+  (논문, 특허, 제품 출시, 고객사 공급 여부 등과 연결)
+
+- SK hynix를 기준으로 경쟁사 위치를 비교:
+  → "기술 성숙도 vs 시장 적용 수준" 관점
+
+- 반드시 비교 가능한 형태 포함:
+  - Markdown 표 또는 매트릭스
+
+예시 항목:
+| 기업 | TRL | 양산 여부 | 주요 기술 | 위협 수준 |
+
+---
+
+## 5장. 전략적 시사점
+
+- 반드시 SK hynix의 R&D 의사결정을 지원하는 형태로 작성
+
+1) 위협 요소
+- 경쟁사의 TRL, 투자 규모, 고객사 확보 여부 기반 분석
+
+2) 기회 요소
+- SK hynix가 선점 가능한 기술 영역
+- 경쟁사 대비 공백 영역
+
+3) 대응 전략 (핵심)
+- 실행 가능한 수준으로 작성
+  (예: HBM4 특정 기술 선행 투자, PIM 통합 가속 등)
+- 우선순위 또는 영향도 포함 (High / Medium / Low)
+
+→ "즉시 실행 가능한 전략" 최소 2개 이상 포함
+
+---
+
+## REFERENCE
+
+- 논문, 특허, 기사, 발표자료 등
+- 반드시 URL 포함
+
+---
+
 """
 
 def draft_generation_node(state: SupervisorState) -> SupervisorState:
@@ -689,9 +898,10 @@ def draft_generation_node(state: SupervisorState) -> SupervisorState:
     if retry_count > 0:
         feedback_section = f"\n[이전 검증 피드백]\n{validation.get('feedback', '')}\n위 피드백을 반영하여 개선하세요."
 
+    analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
     prompt = f"""
 분석 결과:
-{json.dumps(analysis, ensure_ascii=False, indent=2)[:4000]}
+{analysis_json[:12000]}
 {feedback_section}
 
 위 내용을 바탕으로 전략 보고서 초안을 작성하세요.
@@ -716,17 +926,66 @@ def draft_generation_node(state: SupervisorState) -> SupervisorState:
 # 9. Validation (검증 노드)
 # ═══════════════════════════════════════════════════════
 VALIDATION_PROMPT = """
-당신은 기술 보고서 품질 검토자입니다. 아래 기준으로 보고서를 평가하세요.
+당신은 기술 전략 보고서를 검토하는 시니어 컨설턴트입니다.
+아래 기준에 따라 보고서를 엄격하게 평가하세요.
 
-검증 기준:
-1. 모든 필수 섹션(SUMMARY, 1~5장, REFERENCE) 포함 여부
-2. 기업별 분석에 근거 자료(출처) 포함 여부
-3. TRL 추정 시 한계 고지 여부
-4. 전략적 시사점의 구체성 (단순 나열이 아닌 실행 가능한 제안)
-5. 비교 가능한 형태(매트릭스 또는 표)로 기업 비교 포함 여부
+[평가 원칙]
+- 단순 포함 여부가 아니라 "품질 수준"까지 평가
+- 기준을 만족하지 못하면 반드시 failed 처리
+- 모호한 표현, 근거 없는 주장, 정량 데이터 부족은 모두 감점 요인
 
-JSON으로 응답:
-{{"passed": true|false, "feedback": "개선 사항 구체적으로..."}}
+---
+
+[검증 기준]
+
+1. 구조 완전성
+- SUMMARY, 1~5장, REFERENCE, 분석 한계 고지가 모두 존재해야 함
+- 마크다운 헤더 구조가 유지되어야 함
+
+2. 정량 데이터 포함 여부 (중요)
+- 시장 규모, 점유율, CAGR, 특허 수, 논문 수, 성능 수치 등 정량 지표를 포함해야 함
+- 최소 2개 이상의 정량 지표 포함 필수
+- 서로 다른 유형의 지표 포함 필요 (예: 시장 규모 + 기술 성능, 특허 수 + 점유율 등)
+- 단순 설명 위주이거나 정량 데이터가 부족하면 실패 처리
+
+3. 근거 기반 분석
+- 경쟁사 분석에 출처 또는 근거 명시 여부
+- "추정", "가능성" 등의 표현만 있고 근거가 없으면 실패
+
+4. TRL 분석 타당성
+- TRL 숫자가 명시되어야 함
+- TRL 판단 근거 (논문, 특허, 제품, 뉴스 등)와 연결되어야 함
+- 분석 한계 고지 포함 여부
+
+5. 경쟁사 비교 구조
+- 기업 간 비교가 가능한 형태로 정리되어야 함
+  (매트릭스, 표, 또는 명확한 비교 서술)
+- 단순 나열일 경우 실패
+
+6. 전략적 시사점의 실행 가능성
+- "해야 한다" 수준이 아닌 구체적 실행 전략 포함
+- 최소 1개 이상의 실행 가능한 액션 아이템 포함
+
+---
+
+[평가 결과 생성 규칙]
+
+- 모든 기준을 만족하면: "passed": true
+- 하나라도 부족하면: "passed": false
+
+- feedback에는 반드시:
+  1) 부족한 항목
+  2) 왜 문제인지
+  3) 어떻게 수정해야 하는지
+를 구체적으로 작성
+
+---
+
+JSON 형식으로만 응답:
+{
+  "passed": true | false,
+  "feedback": "구체적인 개선 사항"
+}
 """
 
 def validation_node(state: SupervisorState) -> SupervisorState:
@@ -736,7 +995,7 @@ def validation_node(state: SupervisorState) -> SupervisorState:
 
     messages = [
         SystemMessage(content=VALIDATION_PROMPT),
-        HumanMessage(content=f"보고서 초안:\n{draft[:5000]}"),
+        HumanMessage(content=f"보고서 초안:\n{draft[:]}"),
     ]
     response = fast_llm.invoke(messages)
     raw = response.content.strip()
@@ -745,7 +1004,7 @@ def validation_node(state: SupervisorState) -> SupervisorState:
         json_str = re.search(r"\{.*\}", raw, re.DOTALL).group()
         result = json.loads(json_str)
     except Exception:
-        result = {"passed": True, "feedback": "파싱 실패 — 기본 통과"}
+        result = {"passed": False, "feedback": "JSON 파싱 실패 — 형식 오류로 재생성 필요"}
 
     new_validation: ValidationState = {
         "passed": result.get("passed", True),
@@ -774,7 +1033,7 @@ def formatting_node(state: SupervisorState) -> SupervisorState:
 > **분석 대상 기업:** {', '.join(companies)}
 > **분석 기술:** {', '.join(techs)}
 > **작성일:** {today}
-> **분석 도구:** AI 에이전트 시스템 (Web Search + RAG)
+> **분석 도구:** AI 에이전트 시스템 (Tavily 웹 검색 + RAG)
 
 ---
 
@@ -783,7 +1042,7 @@ def formatting_node(state: SupervisorState) -> SupervisorState:
 
 ---
 
-> **⚠️ 분석 한계 고지**
+> **분석 한계 고지**
 > TRL 4~6 구간은 기업 비공개 영역으로, 본 보고서의 기술 성숙도 평가는
 > 특허 출원 수·논문 발표 빈도·채용 공고 키워드 등 **간접 지표 기반 추정**입니다.
 > 직접적인 기술 수준 확인이 아님을 명시합니다.

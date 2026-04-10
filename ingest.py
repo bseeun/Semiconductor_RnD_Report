@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import re
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from config import get_chroma_client, get_collection
@@ -52,25 +53,120 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str
 def read_plain_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
+## PDF 텍스트 추출 보조 클래스 및 함수 (pdfminer.six 활용-> 텍스트 위치 기반으로 2단 레이아웃 감지 및 라인 병합)
+
+@dataclass
+class PdfTextSpan:
+    x: float
+    y: float
+    text: str
+
+
+def _merge_spans_into_lines(spans: list[PdfTextSpan], y_tolerance: float = 3.0) -> list[str]:
+    """좌표가 비슷한 span을 한 줄로 합친다."""
+    if not spans:
+        return []
+
+    ordered = sorted(spans, key=lambda item: (-item.y, item.x))
+    lines: list[tuple[float, list[PdfTextSpan]]] = []
+
+    for span in ordered:
+        if not lines or abs(lines[-1][0] - span.y) > y_tolerance:
+            lines.append((span.y, [span]))
+            continue
+        lines[-1][1].append(span)
+
+    merged: list[str] = []
+    for _y, line_spans in lines:
+        line_spans.sort(key=lambda item: item.x)
+        parts: list[str] = []
+        for span in line_spans:
+            piece = span.text.strip()
+            if not piece:
+                continue
+            if not parts:
+                parts.append(piece)
+                continue
+            prev = parts[-1]
+            if prev.endswith("-"):
+                parts[-1] = prev[:-1] + piece
+            elif re.match(r"^[,.;:)\]%]$", piece):
+                parts[-1] = prev + piece
+            else:
+                parts.append(piece)
+        line = " ".join(parts).strip()
+        if line:
+            merged.append(line)
+    return merged
+
+
+def _page_is_probably_two_column(spans: list[PdfTextSpan], page_width: float) -> bool:
+    """본문 span 분포를 보고 2단 레이아웃 여부를 추정한다."""
+    if len(spans) < 20 or page_width <= 0:
+        return False
+
+    center = page_width / 2.0
+    gutter = page_width * 0.08
+    left = [span for span in spans if span.x < center - gutter]
+    right = [span for span in spans if span.x > center + gutter]
+    middle = [span for span in spans if center - gutter <= span.x <= center + gutter]
+
+    if len(left) < 8 or len(right) < 8:
+        return False
+
+    return len(middle) <= max(6, len(spans) // 10)
+
+
+def _read_pdf_pages_with_pdfminer(path: Path) -> list[tuple[int, str]]:
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTTextContainer
+
+    pages: list[tuple[int, str]] = []
+    for i, page_layout in enumerate(extract_pages(str(path)), start=1):
+        spans: list[PdfTextSpan] = []
+        for element in page_layout:
+            if not isinstance(element, LTTextContainer):
+                continue
+            text = normalize_text(element.get_text() or "")
+            if not text:
+                continue
+            spans.append(
+                PdfTextSpan(
+                    x=float(element.x0),
+                    y=float(element.y0),
+                    text=text,
+                )
+            )
+
+        if not spans:
+            pages.append((i, ""))
+            continue
+
+        page_width = max(1.0, float(page_layout.x1) - float(page_layout.x0))
+        if not _page_is_probably_two_column(spans, page_width):
+            ordered = sorted(spans, key=lambda item: (-item.y, item.x))
+            raw = "\n".join(span.text for span in ordered if span.text.strip())
+            pages.append((i, normalize_text(raw)))
+            continue
+
+        center = page_width / 2.0
+        gutter = page_width * 0.08
+        left_spans = [span for span in spans if span.x < center - gutter]
+        right_spans = [span for span in spans if span.x > center + gutter]
+        middle_spans = [span for span in spans if center - gutter <= span.x <= center + gutter]
+
+        blocks: list[str] = []
+        if middle_spans:
+            blocks.append("\n".join(_merge_spans_into_lines(middle_spans)))
+        blocks.append("\n".join(_merge_spans_into_lines(left_spans)))
+        blocks.append("\n".join(_merge_spans_into_lines(right_spans)))
+        pages.append((i, normalize_text("\n\n".join(block for block in blocks if block.strip()))))
+    return pages
+
 
 def read_pdf_pages(path: Path) -> list[tuple[int, str]]:
-    """페이지별 (1-based page_no, text). 추출 실패 시 빈 문자열."""
-    try:
-        from pypdf import PdfReader
-    except ImportError as e:
-        raise ImportError(
-            "PDF 적재에는 pypdf가 필요합니다. pip install pypdf"
-        ) from e
-
-    reader = PdfReader(str(path))
-    out: list[tuple[int, str]] = []
-    for i, page in enumerate(reader.pages, start=1):
-        try:
-            raw = page.extract_text() or ""
-        except Exception:
-            raw = ""
-        out.append((i, normalize_text(raw)))
-    return out
+    """pdfminer.six로 페이지 텍스트를 읽는다."""
+    return _read_pdf_pages_with_pdfminer(path)
 
 
 def ingest_text_document(

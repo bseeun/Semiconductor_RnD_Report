@@ -96,6 +96,14 @@ def run_analysis(
     # 그래프 실행
     final_state = app.invoke(initial_state, config=config)
 
+    if os.getenv("LANGCHAIN_TRACING_V2", "").lower() in ("true", "1", "yes"):
+        try:
+            from langchain_core.tracers.langchain import wait_for_all_tracers
+
+            wait_for_all_tracers()
+        except Exception:
+            pass
+
     report = final_state.get("final_report", "보고서 생성 실패")
 
     # 파일 저장 (옵션)
