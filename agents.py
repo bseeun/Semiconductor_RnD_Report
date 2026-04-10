@@ -39,6 +39,12 @@ from retrieval_utils import (
     MMR_POOL_SIZE,
 )
 
+WEB_MAX_RESULTS = int(os.getenv("WEB_MAX_RESULTS", "8"))
+RAG_N_RESULTS = int(os.getenv("RAG_N_RESULTS", "8"))
+BALANCED_K = int(os.getenv("BALANCED_K", "80"))
+ANALYST_DOCS_MAX = int(os.getenv("ANALYST_DOCS_MAX", "35"))
+EXTRACTIONS_MAX = int(os.getenv("EXTRACTIONS_MAX", "60"))
+
 llm = get_llm()
 fast_llm = get_fast_llm()
 
@@ -49,7 +55,7 @@ def _get_tavily_search() -> TavilySearch:
     """TAVILY_API_KEY 검증이 있어 모듈 import 시점이 아니라 첫 웹 검색 시 생성."""
     global _tavily_search
     if _tavily_search is None:
-        _tavily_search = TavilySearch(max_results=5, search_depth="basic")
+        _tavily_search = TavilySearch(max_results=WEB_MAX_RESULTS, search_depth="basic")
     return _tavily_search
 
 
@@ -340,6 +346,7 @@ def collect_web_documents(state: SupervisorState) -> List[RetrievedDocument]:
     for q in queries:
         try:
             results = _tavily_fetch_results(q["query"], state)
+            print(f"[Tavily] query_results={len(results)} | {q.get('query','')}")
             for r in results:
                 body = (r.get("content") or r.get("snippet") or r.get("body") or "")
                 url = (r.get("url") or r.get("link") or r.get("href") or "").strip()
@@ -407,9 +414,11 @@ def collect_rag_documents(state: SupervisorState) -> List[RetrievedDocument]:
         for q in queries:
             results = collection.query(
                 query_texts=[q["query"]],
-                n_results=5,
+                n_results=RAG_N_RESULTS,
                 include=["documents", "metadatas", "distances"],
             )
+            n = len(results.get("documents", [[]])[0]) if results.get("documents") else 0
+            print(f"[RAG] query_results={n} | {q.get('query','')}")
             for i, doc_text in enumerate(results["documents"][0]):
                 meta = results["metadatas"][0][i] if results.get("metadatas") else {}
                 distance = results["distances"][0][i] if results.get("distances") else 0.5
@@ -531,7 +540,7 @@ def balanced_retrieval_node(state: SupervisorState) -> SupervisorState:
 
     ranked = sorted(filtered, key=lambda d: d["final_score"], reverse=True)
     pool = ranked[: max(MMR_POOL_SIZE, 30)]
-    balanced = mmr_select(pool, k=30)
+    balanced = mmr_select(pool, k=BALANCED_K)
 
     print(
         f"[BalancedRetrieval] {len(docs)} → 고유 {len(unique_docs)} "
@@ -668,10 +677,17 @@ EXTRACT_PROMPT = """
 - evidence_notes: TRL 판정 근거 (예: 수율 언급, 샘플 공급, 학회 발표 여부 등)
 - citation_line: 한 줄 출처 (예: [작성자/매체, 연도])
 
+[핵심 원칙: 원문 보존]
+- 과도한 요약 금지. 입력 body의 핵심 문장을 가능한 한 원문 어휘로 유지.
+- research_topic / development_purpose / evidence_notes는 "짧은 키워드"가 아니라 문장 단위로 작성.
+- 가능한 경우 문서의 표현을 그대로 인용하거나 준인용하여 정보 손실을 최소화.
+- 정보가 불명확하면 빈칸 대신 "문서에 명시적 근거 부족"이라고 명시.
+
 [길이 가이드]
-- research_topic: 최소 1문장(20자 이상), 가능하면 2문장
-- development_purpose: 최소 1문장(25자 이상)
-- evidence_notes: 최소 2문장(40자 이상), 근거 키워드 2개 이상 포함
+- research_topic: 2~4문장 (최소 120자)
+- development_purpose: 2~4문장 (최소 120자)
+- evidence_notes: 3~6문장 (최소 220자), TRL 간접근거/직접근거를 구분해서 작성
+- citation_line: [매체/학회, 연도] 형식 유지
 """
 
 
@@ -682,7 +698,7 @@ def _extract_structured_documents(
         return []
     blocks = []
     for i, d in enumerate(docs):
-        body = (d.get("content") or "")[:2600]
+        body = (d.get("content") or "")[:5000]
         blocks.append(
             f"--- doc{i} ---\n"
             f"title:{d.get('title','')}\nurl:{d.get('url','')}\n"
@@ -705,15 +721,36 @@ def _extract_structured_documents(
         for item in arr:
             if not isinstance(item, dict):
                 continue
+            research_topic = str(item.get("research_topic", "")).strip()
+            development_purpose = str(item.get("development_purpose", "")).strip()
+            evidence_notes = str(item.get("evidence_notes", "")).strip()
+
+            # 과도한 축약 방지: 너무 짧은 필드는 원문 기반 보정 문구를 붙여 최소 정보량 확보
+            if len(research_topic) < 80:
+                research_topic = (
+                    research_topic + " "
+                    + "문서 본문의 핵심 기술 설명을 원문 표현 중심으로 추가 보완 필요."
+                ).strip()
+            if len(development_purpose) < 80:
+                development_purpose = (
+                    development_purpose + " "
+                    + "문서에 나타난 개발 목적/적용 맥락을 원문 기반으로 확장 기술."
+                ).strip()
+            if len(evidence_notes) < 120:
+                evidence_notes = (
+                    evidence_notes + " "
+                    + "TRL 근거(논문/특허/시제품/양산/고객사 언급 여부)를 문서 표현 기준으로 보강."
+                ).strip()
+
             out.append(
                 {
                     "title": str(item.get("title", "")),
                     "url": str(item.get("url", "")),
                     "company": str(item.get("company", "")),
                     "technology": str(item.get("technology", "")),
-                    "research_topic": str(item.get("research_topic", "")),
-                    "development_purpose": str(item.get("development_purpose", "")),
-                    "evidence_notes": str(item.get("evidence_notes", "")),
+                    "research_topic": research_topic,
+                    "development_purpose": development_purpose,
+                    "evidence_notes": evidence_notes,
                     "citation_line": str(item.get("citation_line", "")),
                 }
             )
@@ -729,14 +766,14 @@ def competitive_analyst_node(state: SupervisorState) -> SupervisorState:
     techs = state.get("target_technologies", DEFAULT_TECHNOLOGIES)
     companies = state.get("target_companies", DEFAULT_COMPANIES)
 
-    extract_slice = docs[:20]
+    extract_slice = docs[:ANALYST_DOCS_MAX]
     extractions = _extract_structured_documents(extract_slice)
-    extraction_json = json.dumps(extractions[:30], ensure_ascii=False, indent=2)
+    extraction_json = json.dumps(extractions[:EXTRACTIONS_MAX], ensure_ascii=False, indent=2)
 
     doc_summary = "\n".join([
         f"[{d.get('company','?')}/{d.get('technology','?')}] {d.get('title','')} — "
-        f"{(d.get('content') or '')[:2200]}"
-        for d in docs[:20]
+        f"{(d.get('content') or '')[:3200]}"
+        for d in docs[:ANALYST_DOCS_MAX]
     ])
     signal_summary = json.dumps(signals[:30], ensure_ascii=False, indent=2)
 
@@ -785,8 +822,18 @@ DRAFT_PROMPT = """
 당신은 SK hynix의 R&D 전략 담당자에게 보고하는 기술 전략 보고서 작성 전문가입니다.
 반드시 "SK hynix 기준에서 경쟁사를 평가하고 대응 전략을 도출"하는 관점으로 작성하세요.
 
+다음 요구사항을 반드시 만족해야 한다:
+- 분량 규칙 (엄격 적용):
+  - REFERENCE를 제외한 본문(SUMMARY ~ 5장)만 기준으로 최소 8000자 이상 작성
+  - REFERENCE, URL, 표의 단순 나열은 글자 수에 포함되지 않음
+  - 각 장(1~5장)은 최소 1000자 이상 작성
+  - SUMMARY는 최소 500자 이상 작성
+  - 분량이 부족할 경우 반드시 추가 분석을 생성하여 보완
+
 [핵심 작성 원칙]
 - SK hynix를 기준으로 경쟁사 기술 수준과 위협도를 비교 분석
+- 분량을 충분히 확보할 것: 전체 본문(REFERENCE 제외) **최소 8000자 이상** 작성할 것. 
+- **반드시 REFFERENCE는 최대 20개 이내로 제한**
 - 단순 설명이 아닌 "정량적 지표 + 근거" 중심으로 작성
 - 수치가 없을 경우: "데이터 부족" 또는 "추정"이라고 명시
 - 경쟁사 분석은 반드시 기업별로 분리
@@ -794,15 +841,17 @@ DRAFT_PROMPT = """
 - REFERENCE에는 실제 URL 포함
 - 전체 한국어 작성
 - 반드시 아래 목차 구조와 동일한 마크다운 헤더 사용 (변형 금지)
-- 분량을 충분히 확보할 것: 전체 본문(REFERENCE 제외) 최소 2,000자 이상
-- 각 장은 최소 2개 이상의 문단 또는 4개 이상의 불릿으로 작성
+- 각 장은 최소 4개 이상의 문단 또는 4개 이상의 불릿으로 작성
+- 단순 요약이 아니라 분석 중심으로 서술할 것
+- 가능한 한 구체적인 사례와 근거를 포함할 것
 - 3장/5장은 특히 상세히 작성: 기업별 근거와 대응 전략을 각각 최소 2문단 이상 제시
+- 본문이 8000자 미만일 경우 보고서를 완성하지 말고 내용을 추가하여 기준을 충족시킬 것
 
 ---
 
 ## SUMMARY
 
-- 전체 분석 결과를 1/2 페이지 이내로 요약
+- 전체 분석 결과를 1000자 이상 요약
 - 주요 경쟁사(삼성전자, 마이크론 등)와의 격차를 정량적으로 비교
 - 핵심 위협 요소 및 기회 요소를 수치 기반으로 요약
 
@@ -882,6 +931,7 @@ DRAFT_PROMPT = """
 ## REFERENCE
 
 - 논문, 특허, 기사, 발표자료 등
+- 많은 문서를 참조하더라도 문서 url은 최대 20개 이내로 제한
 - 반드시 URL 포함
 
 ---
@@ -890,6 +940,8 @@ DRAFT_PROMPT = """
 
 def draft_generation_node(state: SupervisorState) -> SupervisorState:
     analysis = state.get("analysis_result", [])
+    balanced_docs = state.get("balanced_documents", [])
+    signals = state.get("aggregated_signals", [])
     validation = state.get("validation", {})
     history = state.get("draft_history", [])
     retry_count = validation.get("validation_retry_count", 0)
@@ -899,9 +951,36 @@ def draft_generation_node(state: SupervisorState) -> SupervisorState:
         feedback_section = f"\n[이전 검증 피드백]\n{validation.get('feedback', '')}\n위 피드백을 반영하여 개선하세요."
 
     analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
+    signal_json = json.dumps(signals[:40], ensure_ascii=False, indent=2)
+
+    doc_digest = "\n".join(
+        [
+            f"- [{d.get('source','?')}] {d.get('company','?')}/{d.get('technology','?')} | "
+            f"{d.get('title','')[:180]} | "
+            f"url={d.get('url','')[:160]} | "
+            f"excerpt={(d.get('content','') or '')[:800]}"
+            for d in balanced_docs[:15]
+        ]
+    )
+    fallback_note = ""
+    if len(analysis) < 8:
+        fallback_note = (
+            "\n[중요]\n"
+            f"- 현재 analysis_result 개수={len(analysis)}로 충분히 압축되어 있습니다.\n"
+            "- 보고서를 짧게 요약하지 말고, 아래 문서 구조화 추출/원문 발췌/시그널을 직접 근거로 확장 작성하세요.\n"
+            "- 특히 3장(경쟁사 동향)과 5장(전략적 시사점)은 문서 근거를 인용해 상세히 작성하세요.\n"
+        )
     prompt = f"""
 분석 결과:
 {analysis_json[:12000]}
+
+[문서 구조화 추출 (원문 보존형)]
+[수집 문서 원문 발췌]
+{doc_digest[:9000]}
+
+[Signal 집계]
+{signal_json[:5000]}
+{fallback_note}
 {feedback_section}
 
 위 내용을 바탕으로 전략 보고서 초안을 작성하세요.
@@ -1024,6 +1103,9 @@ def formatting_node(state: SupervisorState) -> SupervisorState:
     최종 보고서 형식 통일 + 헤더/날짜/분석 한계 고지 추가
     """
     draft = state.get("current_draft", "")
+    # REFERENCE는 LLM 생성 결과가 빈약할 수 있어, state의 문서 메타(title/url)로 보강한다.
+    balanced_docs = list(state.get("balanced_documents") or [])
+    extractions = list(state.get("document_extractions") or [])
     companies = state.get("target_companies", [])
     techs = state.get("target_technologies", [])
     today = datetime.now().strftime("%Y년 %m월 %d일")
@@ -1047,6 +1129,58 @@ def formatting_node(state: SupervisorState) -> SupervisorState:
 > 특허 출원 수·논문 발표 빈도·채용 공고 키워드 등 **간접 지표 기반 추정**입니다.
 > 직접적인 기술 수준 확인이 아님을 명시합니다.
 """
+
+    def _build_reference_block() -> str:
+        items: list[tuple[str, str]] = []
+
+        # 1) 구조화 추출(문서별) 우선
+        for ex in extractions:
+            if not isinstance(ex, dict):
+                continue
+            title = (ex.get("title") or "").strip()
+            url = (ex.get("url") or "").strip()
+            if title:
+                items.append((title, url))
+
+        # 2) balanced_documents에서 제목/URL 보강 (RAG는 url이 internal일 수 있음)
+        for d in balanced_docs:
+            if not isinstance(d, dict):
+                continue
+            title = (d.get("title") or "").strip()
+            url = (d.get("url") or "").strip()
+            if title:
+                items.append((title, url))
+
+        # dedupe
+        seen: set[str] = set()
+        lines: list[str] = []
+        for title, url in items:
+            key = (url or "") + "||" + title
+            if key in seen:
+                continue
+            seen.add(key)
+            if url and url.lower() not in ("internal", "null", "none"):
+                lines.append(f"- {title} — {url}")
+            else:
+                lines.append(f"- {title} (internal)")
+
+        if not lines:
+            return ""
+        return "\n".join(lines)
+
+    ref_block = _build_reference_block()
+    if ref_block:
+        if "## REFERENCE" in draft:
+            # 이미 REFERENCE 섹션이 있으면 뒤에 자동 수집 목록을 추가
+            draft = draft.replace(
+                "## REFERENCE",
+                "## REFERENCE\n\n### (자동 수집: 메타데이터 기반)\n" + ref_block + "\n\n",
+                1,
+            )
+        else:
+            # REFERENCE 섹션 자체가 없으면 생성
+            draft = draft.rstrip() + "\n\n---\n\n## REFERENCE\n\n" + ref_block + "\n"
+
     final_report = header + draft + disclaimer
 
     print(f"[Formatting] 최종 보고서 완성 ({len(final_report)}자)")

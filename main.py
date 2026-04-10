@@ -2,6 +2,7 @@
 main.py — 에이전트 실행 진입점
 """
 import os
+import textwrap
 import uuid
 from datetime import datetime
 
@@ -17,6 +18,143 @@ configure_langsmith()
 from graph import app
 from state import SupervisorState
 from config import DEFAULT_TECHNOLOGIES, DEFAULT_COMPANIES
+
+
+def _render_markdown_pdf(report_markdown: str, output_path: str) -> bool:
+    """
+    Markdown -> HTML -> PDF 렌더링.
+    성공하면 True, 실패하면 False를 반환한다.
+    """
+    try:
+        import markdown as md
+        from weasyprint import HTML
+    except Exception:
+        return False
+
+    html_body = md.markdown(
+        report_markdown,
+        extensions=["extra", "tables", "fenced_code", "sane_lists"],
+    )
+    html = f"""
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @page {{
+      size: A4;
+      margin: 18mm 14mm;
+    }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+      line-height: 1.6;
+      color: #1f2937;
+      font-size: 11pt;
+      word-break: break-word;
+    }}
+    h1, h2, h3 {{
+      color: #111827;
+      margin-top: 18px;
+      margin-bottom: 8px;
+      line-height: 1.35;
+    }}
+    h1 {{ font-size: 20pt; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; }}
+    h2 {{ font-size: 15pt; border-left: 4px solid #2563eb; padding-left: 8px; }}
+    h3 {{ font-size: 12pt; }}
+    p {{ margin: 7px 0; }}
+    ul, ol {{ margin: 6px 0 8px 20px; }}
+    li {{ margin: 2px 0; }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #f3f4f6;
+      border-radius: 4px;
+      padding: 1px 4px;
+      font-size: 9.8pt;
+    }}
+    pre {{
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      padding: 10px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10px 0 14px;
+      font-size: 10pt;
+    }}
+    th, td {{
+      border: 1px solid #d1d5db;
+      padding: 6px 8px;
+      vertical-align: top;
+    }}
+    th {{
+      background: #f3f4f6;
+      font-weight: 700;
+    }}
+    blockquote {{
+      margin: 10px 0;
+      padding: 6px 10px;
+      border-left: 4px solid #93c5fd;
+      background: #eff6ff;
+      color: #1e3a8a;
+    }}
+    hr {{
+      border: 0;
+      border-top: 1px solid #e5e7eb;
+      margin: 14px 0;
+    }}
+  </style>
+</head>
+<body>
+{html_body}
+</body>
+</html>
+"""
+    try:
+        HTML(string=html).write_pdf(output_path)
+        return True
+    except Exception:
+        return False
+
+
+def _save_report_pdf(report: str, output_path: str) -> None:
+    """텍스트 보고서를 PDF로 저장."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+
+    c = canvas.Canvas(output_path, pagesize=A4)
+    width, height = A4
+    left, top, bottom = 40, height - 40, 40
+    line_height = 14
+
+    # 한글 표시용 CID 폰트 시도 (환경에 따라 실패할 수 있어 fallback 포함)
+    font_name = "Helvetica"
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
+        font_name = "HYSMyeongJo-Medium"
+    except Exception:
+        font_name = "Helvetica"
+
+    y = top
+    c.setFont(font_name, 10)
+    max_chars = 95 if font_name == "Helvetica" else 70
+
+    for raw_line in report.splitlines():
+        wrapped = textwrap.wrap(raw_line, width=max_chars) or [""]
+        for line in wrapped:
+            if y <= bottom:
+                c.showPage()
+                c.setFont(font_name, 10)
+                y = top
+            c.drawString(left, y, line)
+            y -= line_height
+
+    c.save()
 
 
 def run_analysis(
@@ -109,8 +247,15 @@ def run_analysis(
     # 파일 저장 (옵션)
     if output_path:
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(report)
+        if output_path.lower().endswith(".pdf"):
+            # 1) 예쁜 렌더링: Markdown -> HTML -> PDF
+            # 2) 실패 시 텍스트 PDF fallback
+            ok = _render_markdown_pdf(report, output_path)
+            if not ok:
+                _save_report_pdf(report, output_path)
+        else:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(report)
         print(f"\n[완료] 보고서 저장: {output_path}")
     else:
         print("\n" + "="*60)
@@ -124,5 +269,5 @@ if __name__ == "__main__":
     # 예시 실행
     run_analysis(
         user_query="HBM4, PIM, CXL 기술에 대한 삼성전자·마이크론·SK하이닉스의 최신 R&D 동향을 분석하고 전략 보고서를 작성해줘",
-        output_path=f"reports/semiconductor_report_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
+        output_path=f"reports/semiconductor_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
     )
