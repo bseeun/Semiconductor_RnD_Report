@@ -25,7 +25,14 @@ Semiconductor R&D Intelligence Agent
 | Observability | LangSmith |
 | Output     | Markdown -> HTML -> PDF (WeasyPrint) |
 
-> 최근 FAISS 소규모 평가 예시: `Hit@5=1.000`, `MRR=1.000` (4개 테스트 쿼리)
+> 최근 FAISS 소규모 평가 예시: `Hit@5=0.750`, `MRR=0.500` (4개 테스트 쿼리)
+>
+> - JEDEC HBM4 memory standard: `hit@5=1`, `rank=2`, `rr=0.500`
+> - Samsung CXL memory expansion whitepaper: `hit@5=0`, `rank=-`, `rr=0.000`
+> - Micron CXL platform: `hit@5=1`, `rank=2`, `rr=0.500`
+> - SK Hynix PIM processing in memory: `hit@5=1`, `rank=1`, `rr=1.000`
+>
+> 해석: 현재 샘플 기준으로 4개 중 3개 쿼리에서 Top-5 내 관련 문서를 찾았고, 평균 첫 정답 순위는 2위 수준입니다.
 
 ## Agents
 
@@ -67,8 +74,9 @@ flowchart TD
 ├── state.py                   # 상태 스키마
 ├── langsmith_setup.py         # LangSmith 초기화
 ├── eval/
-│   ├── retrieval_eval.py      # Chroma 소규모 Hit@K/MRR
-│   └── faiss_retrieval_eval.py# FAISS Hit@K/MRR
+│   ├── export_doc_ids.py      # qrels용 doc_id 후보 추출
+│   ├── faiss_retrieval_eval.py# FAISS Hit@K/MRR
+│   └── qrels.jsonl            # qrels (query -> relevant_doc_ids)
 ├── reports/                   # 생성 보고서 (md/pdf)
 ├── docs/
 │   └── corpus.md              # 코퍼스 매핑
@@ -91,6 +99,25 @@ python ingest.py --dir docs/pdfs
 python main.py
 ```
 
+## Retrieval Eval (FAISS)
+
+```bash
+# 1) 샘플 qrels 복사 후 relevant_doc_ids 채우기
+cp eval/qrels.sample.jsonl eval/qrels.jsonl
+
+# 1-1) doc_id 모를 때: 쿼리별 top-k 후보 출력
+python -m eval.export_doc_ids --queries-file eval/qrels.sample.jsonl --topk 10
+
+# 2) FAISS 평가 실행
+python -m eval.faiss_retrieval_eval --k 5 --qrels eval/qrels.jsonl
+```
+
+평가 방식 요약:
+- `eval/faiss_retrieval_eval.py`는 Chroma 코퍼스를 읽어 FAISS(IndexFlatIP)로 검색하고, `qrels.jsonl`의 `relevant_doc_ids`를 기준으로 Hit@K/MRR을 계산합니다.
+- `eval/export_doc_ids.py`로 쿼리별 후보 `doc_id`를 먼저 확인한 뒤 qrels를 채우는 것을 권장합니다.
+- `relevant_doc_ids` 기반 평가가 기본이며, `needles` 기반 매칭은 하위호환(sanity check) 용도로만 사용됩니다.
+
 ## Contributors
 배세은 : Prompt Engineering 및 LLM Agent 아키텍처 설계, 외부 API 연동을 통한 응답 생성 파이프라인 구축
+
 인유진 : PDF Parsing 및 데이터 전처리 파이프라인 구축, FAISS 기반 Retrieval Agent 구현 및 데이터 수집

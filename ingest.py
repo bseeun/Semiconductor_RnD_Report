@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -185,7 +184,7 @@ def ingest_text_document(
         print(f"  (건너뜀) 내용 없음: {filepath}")
         return 0
 
-    base, _doc_id = build_chroma_document_metadata(
+    base, doc_id = build_chroma_document_metadata(
         filepath, use_llm_fallback=use_llm_fallback
     )
     meta = {
@@ -193,7 +192,8 @@ def ingest_text_document(
         "source": "internal",
         "file_type": source_label,
     }
-    ids = [str(uuid.uuid4()) for _ in chunks]
+    # 재적재해도 동일 청크는 동일 ID를 갖도록 안정적 ID 사용
+    ids = [f"{doc_id}::c{i}" for i in range(len(chunks))]
     metadatas = [
         {**meta, "chunk_index": i, "page": "", "page_chunk_index": ""}
         for i in range(len(chunks))
@@ -213,7 +213,7 @@ def ingest_pdf_document(
 ) -> int:
     """PDF 페이지별 텍스트 추출 → 페이지 단위로 청킹 후 add. 반환: 청크 개수"""
     pages = read_pdf_pages(filepath)
-    base_meta, _doc_id = build_chroma_document_metadata(
+    base_meta, doc_id = build_chroma_document_metadata(
         filepath, use_llm_fallback=use_llm_fallback
     )
     base = {
@@ -233,7 +233,7 @@ def ingest_pdf_document(
         chunks = chunk_text(page_text, chunk_size=chunk_size, overlap=overlap)
         for local_i, chunk in enumerate(chunks):
             all_docs.append(chunk)
-            all_ids.append(str(uuid.uuid4()))
+            all_ids.append(f"{doc_id}::p{page_no}::c{local_i}")
             all_meta.append(
                 {
                     **base,
